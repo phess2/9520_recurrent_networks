@@ -1,0 +1,46 @@
+name: recurrent-networks
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - numpy
+  - scipy
+  - setuptools
+  - wheel
+  - cmake
+  - ninja
+  - git
+  - yaml
+  - pyyaml
+  - pandas
+  - tqdm
+  - pytest
+  - pytest-xdist
+  - pytest-cov
+  - rich
+  - click
+  - pip:
+      # JAX CUDA 12 wheels; rely on pip wheels with bundled CUDA libs (need recent NVIDIA driver)
+      - --find-links https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+      - "jax[cuda12]"
+      # Core ecosystem
+      - optax
+      - chex
+      - einops
+      - ml-collections
+      - wandb
+      # Modula from GitHub
+      - git+https://github.com/modula-systems/modula.git
+      # Optional helpers
+      - dm-haiku
+      - orbax-checkpoint
+      - typing-extensions
+      - dataclasses-json
+      - numpyro
+      - distrax
+
+# Notes:
+# - Do NOT install cudatoolkit via conda when using JAX CUDA pip wheels; it can conflict.
+# - Ensure the system has a recent NVIDIA driver compatible with CUDA 12.x.
