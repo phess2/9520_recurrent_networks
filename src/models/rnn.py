@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Tuple
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -9,7 +9,6 @@ from .base import BaseSequenceModel, ModelConfig
 
 try:
 	from modula.atom import Linear
-	from modula.bond import Tanh, Sigmoid
 	_MODULA_AVAILABLE = True
 except Exception:
 	_MODULA_AVAILABLE = False
@@ -45,9 +44,9 @@ class ElmanRNN(BaseSequenceModel):
 		def step(carry, inputs):
 			h = carry
 			x_t = inputs
-			a = self.wx.apply(params["wx"], x_t) + self.wh.apply(params["wh"], h)
+			a = self.wx(x_t, params["wx"]) + self.wh(h, params["wh"])
 			h = jnp.tanh(a)
-			y = self.wo.apply(params["wo"], h)
+			y = self.wo(h, params["wo"])
 			return h, y
 
 		_, ys = jax.lax.scan(step, h, x.swapaxes(0, 1))
@@ -88,13 +87,13 @@ class LSTM(BaseSequenceModel):
 		def step(carry, inputs):
 			h, c = carry
 			x_t = inputs
-			i = jax.nn.sigmoid(self.wxi.apply(params["wxi"], x_t) + self.whi.apply(params["whi"], h))
-			f = jax.nn.sigmoid(self.wxf.apply(params["wxf"], x_t) + self.whf.apply(params["whf"], h))
-			o = jax.nn.sigmoid(self.wxo.apply(params["wxo"], x_t) + self.who.apply(params["who"], h))
-			g = jnp.tanh(self.wxc.apply(params["wxc"], x_t) + self.whc.apply(params["whc"], h))
+			i = jax.nn.sigmoid(self.wxi(x_t, params["wxi"]) + self.whi(h, params["whi"]))
+			f = jax.nn.sigmoid(self.wxf(x_t, params["wxf"]) + self.whf(h, params["whf"]))
+			o = jax.nn.sigmoid(self.wxo(x_t, params["wxo"]) + self.who(h, params["who"]))
+			g = jnp.tanh(self.wxc(x_t, params["wxc"]) + self.whc(h, params["whc"]))
 			c = f * c + i * g
 			h = o * jnp.tanh(c)
-			y = self.wo.apply(params["wo"], h)
+			y = self.wo(h, params["wo"])
 			return (h, c), y
 
 		_, ys = jax.lax.scan(step, (h, c), x.swapaxes(0, 1))
