@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, Literal
@@ -14,6 +15,21 @@ import wandb
 from ..data.copy_dataset import CopyDataset
 from ..models.base import BaseSequenceModel, ModelConfig
 from ..models.rnn import ElmanRNN
+
+# Suppress Orbax checkpointing warnings about blocking main thread
+# These warnings are informational and don't indicate an error
+class OrbaxWarningFilter(logging.Filter):
+    """Filter to suppress Orbax _SignalingThread.join() warnings."""
+    
+    def filter(self, record):
+        # Suppress warnings about _SignalingThread.join() blocking the main thread
+        if "_SignalingThread.join()" in record.getMessage():
+            return False
+        return True
+
+# Apply filter to absl logger (where Orbax warnings come from)
+absl_logger = logging.getLogger("absl")
+absl_logger.addFilter(OrbaxWarningFilter())
 
 # Type aliases for optimizer and scheduler names
 OptimizerName = Literal["adamw", "sgd", "muon"]
