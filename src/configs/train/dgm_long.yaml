@@ -8,5 +8,7 @@ ckpt_every: 500
 ckpt_metric: nll
 save_best: true
 precision: bfloat16
+entity: your-team-name
 seed: 0
+wandb_api_key:
 

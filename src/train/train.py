@@ -15,9 +15,7 @@ from omegaconf import DictConfig, OmegaConf
 from ..configs.schemas import OptimizerConfig, TrainLoopConfig
 from ..data.dgm_dataset import DGMDataset, DGMConfig
 from ..models.base import BaseSequenceModel, ModelConfig
-from ..models.lru import LinearRecurrentUnit
-from ..models.rnn import ElmanRNN, LSTM
-from ..models.transformer import TransformerAdapter
+from .model_factory import build_model
 
 try:
 	import orbax.checkpoint as ocp
@@ -50,13 +48,6 @@ except Exception:
 
 from ..utils.metrics import mutual_information_placeholder
 
-MODEL_REGISTRY = {
-	"elman": ElmanRNN,
-	"lstm": LSTM,
-	"transformer": TransformerAdapter,
-	"lru": LinearRecurrentUnit,
-}
-
 
 def build_optimizer(cfg: OptimizerConfig, total_steps: int) -> optax.GradientTransformation:
 	if cfg.scheduler == "linear":
@@ -69,6 +60,8 @@ def build_optimizer(cfg: OptimizerConfig, total_steps: int) -> optax.GradientTra
 			decay_steps=max(total_steps - cfg.warmup_steps, 1),
 			end_value=0.0,
 		)
+	elif cfg.scheduler == "none":
+		schedule = cfg.lr
 	else:
 		raise ValueError(f"Unknown scheduler {cfg.scheduler}")
 
@@ -91,32 +84,6 @@ def build_optimizer(cfg: OptimizerConfig, total_steps: int) -> optax.GradientTra
 		return optax.adamw(schedule, weight_decay=cfg.weight_decay)
 	else:
 		raise ValueError(f"Unknown optimizer {cfg.name}")
-
-
-def build_model(model_cfg: DictConfig, train_cfg: TrainLoopConfig) -> tuple[BaseSequenceModel, ModelConfig]:
-	model_dict = OmegaConf.to_container(model_cfg, resolve=True)
-	if not isinstance(model_dict, dict):
-		raise ValueError("Model config must be a mapping.")
-	arch = str(model_dict.get("architecture", "elman")).lower()
-	input_dim = int(model_dict["input_dim"])
-	output_dim = int(model_dict["output_dim"])
-	hidden_dim = int(model_dict["hidden_dim"])
-	num_layers = int(model_dict.get("num_layers", 1))
-	precision = str(model_dict.get("precision", train_cfg.precision))
-	model_config = ModelConfig(
-		input_dim=input_dim,
-		output_dim=output_dim,
-		hidden_dim=hidden_dim,
-		num_layers=num_layers,
-		precision=precision,
-	)
-	kwargs = model_dict.get("kwargs") or {}
-	if isinstance(kwargs, DictConfig):
-		kwargs = OmegaConf.to_container(kwargs, resolve=True) or {}
-	model_cls = MODEL_REGISTRY.get(arch)
-	if model_cls is None:
-		raise ValueError(f"Unknown model architecture '{arch}'.")
-	return model_cls(model_config, **kwargs), model_config
 
 
 def compute_metrics(pred: jnp.ndarray, target: jnp.ndarray, mask: jnp.ndarray, discrete: bool) -> Dict[str, jnp.ndarray]:
@@ -153,9 +120,14 @@ def maybe_cast_precision(x: jnp.ndarray, precision: str) -> jnp.ndarray:
 
 
 def train(model: BaseSequenceModel, model_cfg: ModelConfig, data_cfg: DGMConfig, train_cfg: TrainLoopConfig, optimizer_cfg: OptimizerConfig) -> None:
+	if not train_cfg.entity:
+		raise ValueError("train.entity must be set to the target W&B team.")
+	if train_cfg.wandb_api_key:
+		wandb.login(key=train_cfg.wandb_api_key, relogin=True)
 	wandb.init(
 		project=train_cfg.project,
 		name=train_cfg.run_name,
+		entity=train_cfg.entity,
 		config={
 			"model": model_cfg.__dict__,
 			"data": data_cfg.__dict__,
@@ -283,7 +255,8 @@ def main(cfg: DictConfig) -> None:
 	train_cfg = TrainLoopConfig(**OmegaConf.to_container(cfg.train, resolve=True))
 	optimizer_cfg = OptimizerConfig(**OmegaConf.to_container(cfg.optimizer, resolve=True))
 	data_cfg = DGMConfig(**OmegaConf.to_container(cfg.task, resolve=True))
-	model, model_cfg = build_model(cfg.model, train_cfg)
+	task_dims = {"input_dim": data_cfg.input_dim, "output_dim": data_cfg.output_dim}
+	model, model_cfg = build_model(cfg.model, train_cfg, task_dims)
 	train(model, model_cfg, data_cfg, train_cfg, optimizer_cfg)
 
 

@@ -1,0 +1,5 @@
+architecture: lstm
+hidden_dim: 32
+num_layers: 1
+precision: ${train.precision}
+

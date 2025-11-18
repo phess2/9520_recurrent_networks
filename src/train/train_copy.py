@@ -12,10 +12,10 @@ import optax
 import orbax.checkpoint as ocp
 import wandb
 from omegaconf import DictConfig, OmegaConf
+import re
 from src.configs.schemas import OptimizerConfig, TrainLoopConfig
 from src.data.copy_dataset import CopyDataset
-from src.models.base import BaseSequenceModel, ModelConfig
-from src.models.rnn import ElmanRNN
+from src.train.model_factory import build_model
 
 
 # Suppress Orbax checkpointing warnings about blocking main thread
@@ -33,65 +33,6 @@ class OrbaxWarningFilter(logging.Filter):
 # Apply filter to absl logger (where Orbax warnings come from)
 absl_logger = logging.getLogger("absl")
 absl_logger.addFilter(OrbaxWarningFilter())
-
-class RNNWithEmbedding(BaseSequenceModel):
-    """RNN wrapper that adds embedding layer for discrete token inputs.
-
-    This class wraps an ElmanRNN with an embedding layer to convert discrete
-    token IDs into continuous embeddings before passing them to the RNN.
-    """
-
-    def __init__(self, config: ModelConfig, vocab_size: int, embed_dim: int):
-        # Create a model config for the RNN that uses embedding dimension as input
-        rnn_config = ModelConfig(
-            input_dim=embed_dim,
-            output_dim=config.output_dim,
-            hidden_dim=config.hidden_dim,
-            num_layers=config.num_layers,
-            precision=config.precision,
-        )
-        super().__init__(rnn_config)
-        self.vocab_size = vocab_size
-        self.embed_dim = embed_dim
-        self.rnn = ElmanRNN(rnn_config)
-
-    def initialize(self, key: jax.Array) -> Any:
-        """Initialize model parameters: embedding matrix and RNN weights."""
-        # Split random key for independent initialization of embedding and RNN
-        embedding_key, rnn_key = jax.random.split(key, 2)
-
-        # Initialize embedding matrix: [vocab_size, embed_dim]
-        # Each row represents the embedding vector for a token ID
-        # These are learnable parameters that will be updated during training via backpropagation
-        # Gradients flow through the embedding lookup operation in the forward pass
-        embedding_params = jax.nn.initializers.normal(stddev=0.02)(
-            embedding_key, (self.vocab_size, self.embed_dim), dtype=jnp.float32
-        )
-
-        # Initialize RNN parameters
-        rnn_params = self.rnn.initialize(rnn_key)
-
-        return {"embedding": embedding_params, "rnn": rnn_params}
-
-    def apply(
-        self, params: Any, token_ids: jnp.ndarray, mask: jnp.ndarray
-    ) -> jnp.ndarray:
-        """Forward pass: embed tokens and apply RNN.
-
-        Args:
-            params: Model parameters containing 'embedding' and 'rnn' keys
-            token_ids: Token IDs of shape [batch, seq_len]
-            mask: Attention mask of shape [batch, seq_len]
-
-        Returns:
-            RNN outputs of shape [batch, seq_len, output_dim]
-        """
-        # Look up embeddings for each token ID: [batch, seq_len] -> [batch, seq_len, embed_dim]
-        embeddings = params["embedding"][token_ids]
-
-        # Apply RNN to embedded sequence
-        return self.rnn.apply(params["rnn"], embeddings, mask)
-
 
 def build_optimizer(config: OptimizerConfig, total_steps: int) -> optax.GradientTransformation:
     """Build optimizer with learning rate schedule."""
@@ -197,7 +138,7 @@ def maybe_cast_precision(array: jnp.ndarray, precision: str) -> jnp.ndarray:
 
 def train_copy(
     task_cfg: Dict[str, Any],
-    model_cfg: Dict[str, Any],
+    model_cfg: DictConfig,
     train_cfg: TrainLoopConfig,
     optimizer_cfg: OptimizerConfig,
 ) -> None:
@@ -208,12 +149,17 @@ def train_copy(
     in its hidden state over time.
     """
     # Initialize wandb for experiment tracking
+    if not train_cfg.entity:
+        raise ValueError("train.entity must be set to the target W&B team.")
+    if train_cfg.wandb_api_key:
+        wandb.login(key=train_cfg.wandb_api_key, relogin=True)
     wandb.init(
         project=train_cfg.project,
         name=train_cfg.run_name,
+        entity=train_cfg.entity,
         config={
             "task": task_cfg,
-            "model": model_cfg,
+            "model": OmegaConf.to_container(model_cfg, resolve=True),
             "train": asdict(train_cfg),
             "optimizer": asdict(optimizer_cfg),
         },
@@ -227,26 +173,12 @@ def train_copy(
         num_classes=int(task_cfg["num_classes"]),
     )
 
-    # Create model configuration
-    # Note: input_dim is set to embed_dim, but the actual input will be token IDs
-    # which get embedded before being passed to the RNN
-    embed_dim = int(model_cfg["embed_dim"])
-    hidden_dim = int(model_cfg["hidden_dim"])
-    num_layers = int(model_cfg.get("num_layers", 1))
-    model_config = ModelConfig(
-        input_dim=embed_dim,
-        output_dim=int(task_cfg["num_classes"]),
-        hidden_dim=hidden_dim,
-        num_layers=num_layers,
-        precision=train_cfg.precision,
-    )
+    vocab_size = int(task_cfg["num_classes"])
+    input_dim = int(task_cfg.get("input_dim", vocab_size))
+    output_dim = int(task_cfg.get("output_dim", vocab_size))
+    task_dims = {"input_dim": input_dim, "output_dim": output_dim}
 
-    # Initialize model with embedding layer and RNN
-    model = RNNWithEmbedding(
-        model_config,
-        vocab_size=int(task_cfg["num_classes"]),
-        embed_dim=embed_dim,
-    )
+    model, model_config = build_model(model_cfg, train_cfg, task_dims)
 
     # Build optimizer with learning rate schedule
     optimizer = build_optimizer(optimizer_cfg, train_cfg.steps)
@@ -260,7 +192,7 @@ def train_copy(
     checkpoint_manager = None
     # Build checkpoint directory: checkpoints/{dataset_name}/{architecture_name}
     dataset_name = "copy"
-    architecture_name = "rnn_with_embedding"  # RNNWithEmbedding wraps ElmanRNN
+    architecture_name = re.sub(r"(?<!^)(?=[A-Z])", "_", model.__class__.__name__).lower()
     checkpoint_directory = os.path.abspath(
         os.path.join("checkpoints", dataset_name, architecture_name)
     )
@@ -280,8 +212,11 @@ def train_copy(
 
         def loss_fn(current_params):
             """Compute loss and metrics for current parameters."""
+            embedded_inputs = jax.nn.one_hot(inputs, input_dim, dtype=jnp.float32)
+            embedded_inputs = maybe_cast_precision(embedded_inputs, train_cfg.precision)
+
             # Forward pass: get logits for all positions
-            logits = model.apply(current_params, inputs, mask)
+            logits = model.apply(current_params, embedded_inputs, mask)
 
             # Compute metrics (NLL and accuracy)
             metrics = compute_metrics(logits, shifted_target_ids, shifted_target_mask)
@@ -310,8 +245,11 @@ def train_copy(
         # Shift targets for next-token prediction
         shifted_target_ids, shifted_target_mask = shift_targets(targets, mask)
 
+        embedded_inputs = jax.nn.one_hot(inputs, input_dim, dtype=jnp.float32)
+        embedded_inputs = maybe_cast_precision(embedded_inputs, train_cfg.precision)
+
         # Forward pass: get predictions
-        logits = model.apply(model_params, inputs, mask)
+        logits = model.apply(model_params, embedded_inputs, mask)
 
         # Compute metrics
         metrics = compute_metrics(logits, shifted_target_ids, shifted_target_mask)
@@ -443,10 +381,9 @@ def main(cfg: DictConfig) -> None:
     train_cfg = TrainLoopConfig(**OmegaConf.to_container(cfg.train, resolve=True))
     optimizer_cfg = OptimizerConfig(**OmegaConf.to_container(cfg.optimizer, resolve=True))
     task_cfg = OmegaConf.to_container(cfg.task, resolve=True)
-    model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
-    if not isinstance(task_cfg, dict) or not isinstance(model_cfg, dict):
-        raise ValueError("Task and model configs must be mappings.")
-    train_copy(task_cfg, model_cfg, train_cfg, optimizer_cfg)
+    if not isinstance(task_cfg, dict):
+        raise ValueError("Task config must be a mapping.")
+    train_copy(task_cfg, cfg.model, train_cfg, optimizer_cfg)
 
 
 if __name__ == "__main__":

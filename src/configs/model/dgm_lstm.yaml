@@ -1,7 +1,0 @@
-architecture: lstm
-input_dim: ${task.obs_dims}
-output_dim: ${task.obs_dims}
-hidden_dim: 128
-num_layers: 2
-precision: ${train.precision}
-

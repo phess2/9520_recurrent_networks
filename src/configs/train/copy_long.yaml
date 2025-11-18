@@ -8,5 +8,7 @@ ckpt_every: 1000
 ckpt_metric: accuracy
 save_best: true
 precision: bfloat16
+entity: your-team-name
 seed: 0
+wandb_api_key:
 

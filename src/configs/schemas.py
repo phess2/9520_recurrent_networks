@@ -30,5 +30,7 @@ class TrainLoopConfig:
 	ckpt_metric: str
 	save_best: bool
 	precision: str
+	entity: str
 	seed: int = 0
+	wandb_api_key: str | None = None
 

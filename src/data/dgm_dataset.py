@@ -9,20 +9,8 @@ import jax.numpy as jnp
 
 @dataclass
 class DGMConfig:
-	"""Configuration for multivariate DGM generator.
+	"""Configuration for multivariate DGM generator."""
 
-	- dims: latent dimensionality (for continuous latents only)
-	- obs_dims: observation dimensionality
-	- lags: list of positive integer lags, e.g., [1], [2,7], []
-	- discrete_latent: if True, categorical latent states; else Gaussian
-	- num_categories: number of latent categories if discrete
-	- mean_seq_len: mean of discrete length distribution
-	- std_seq_len: std of discrete length distribution
-	- batch_size: number of sequences per batch
-	- burn_in: number of warmup steps before collecting data
-	- seed: PRNG seed
-	- cov_scale: scale for random covariance generation
-	"""
 	dims: int
 	obs_dims: int
 	lags: List[int]
@@ -34,6 +22,14 @@ class DGMConfig:
 	burn_in: int = 32
 	seed: int = 0
 	cov_scale: float = 0.2
+	input_dim: int | None = None
+	output_dim: int | None = None
+
+	def __post_init__(self) -> None:
+		if self.input_dim is None:
+			self.input_dim = self.obs_dims
+		if self.output_dim is None:
+			self.output_dim = self.obs_dims
 
 
 class DGMDataset:
