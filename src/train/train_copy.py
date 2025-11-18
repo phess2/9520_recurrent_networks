@@ -16,16 +16,18 @@ from ..data.copy_dataset import CopyDataset
 from ..models.base import BaseSequenceModel, ModelConfig
 from ..models.rnn import ElmanRNN
 
+
 # Suppress Orbax checkpointing warnings about blocking main thread
 # These warnings are informational and don't indicate an error
 class OrbaxWarningFilter(logging.Filter):
     """Filter to suppress Orbax _SignalingThread.join() warnings."""
-    
+
     def filter(self, record):
         # Suppress warnings about _SignalingThread.join() blocking the main thread
         if "_SignalingThread.join()" in record.getMessage():
             return False
         return True
+
 
 # Apply filter to absl logger (where Orbax warnings come from)
 absl_logger = logging.getLogger("absl")
@@ -41,7 +43,9 @@ class CopyTrainConfig:
     """Configuration for training an RNN on the copy task.
 
     The copy task tests a model's ability to remember and reproduce a sequence
-    after a delay period (lag). This is a classic benchmark for recurrent networks.
+    after a delay period (lag). The lag is sampled uniformly from [min_lag, max_lag]
+    for each batch, providing a range of difficulty levels. This is a classic
+    benchmark for recurrent networks.
     """
 
     # Wandb logging configuration
@@ -72,7 +76,8 @@ class CopyTrainConfig:
     warmup_steps: int = 100  # Number of warmup steps for learning rate schedule
 
     # Copy task specific hyperparameters
-    lag: int = 10  # Delay between input sequence and target output
+    min_lag: int = 10  # Minimum delay between input sequence and target output
+    max_lag: int = 100  # Maximum delay between input sequence and target output
     batch_size: int = 32
     num_classes: int = 10  # Vocabulary size (number of distinct tokens)
     embed_dim: int = 64  # Embedding dimension for token inputs
@@ -257,7 +262,10 @@ def train_copy(config: CopyTrainConfig) -> None:
 
     # Create dataset generator for the copy task
     dataset = CopyDataset(
-        lag=config.lag, batch_size=config.batch_size, num_classes=config.num_classes
+        min_lag=config.min_lag,
+        max_lag=config.max_lag,
+        batch_size=config.batch_size,
+        num_classes=config.num_classes,
     )
 
     # Create model configuration
@@ -285,7 +293,12 @@ def train_copy(config: CopyTrainConfig) -> None:
 
     # Set up checkpoint manager if orbax is available
     checkpoint_manager = None
-    checkpoint_directory = os.path.abspath("checkpoints")
+    # Build checkpoint directory: checkpoints/{dataset_name}/{architecture_name}
+    dataset_name = "copy"
+    architecture_name = "rnn_with_embedding"  # RNNWithEmbedding wraps ElmanRNN
+    checkpoint_directory = os.path.abspath(
+        os.path.join("checkpoints", dataset_name, architecture_name)
+    )
     checkpoint_manager = ocp.CheckpointManager(
         checkpoint_directory, ocp.PyTreeCheckpointer()
     )
@@ -360,7 +373,11 @@ def train_copy(config: CopyTrainConfig) -> None:
         if best_metric_value is None:
             is_improvement = True
         else:
-            is_improvement = (current_metric_value > best_metric_value) if higher_is_better else (current_metric_value < best_metric_value)
+            is_improvement = (
+                (current_metric_value > best_metric_value)
+                if higher_is_better
+                else (current_metric_value < best_metric_value)
+            )
 
         if is_improvement:
             best_metric_value = current_metric_value
@@ -383,14 +400,8 @@ def train_copy(config: CopyTrainConfig) -> None:
 
     # Main training loop
     for step_index in range(1, config.steps + 1):
-        # Get a batch of training data
-        input_sequence, target_sequence = dataset()
-
-        # Create mask: all positions are valid for the copy task
-        # Shape: [batch_size, sequence_length]
-        attention_mask = jnp.ones(
-            (config.batch_size, input_sequence.shape[1]), dtype=jnp.float32
-        )
+        # Get a batch of training data (now includes mask)
+        input_sequence, target_sequence, attention_mask = dataset()
 
         # Perform one training step: forward pass, backward pass, and parameter update
         model_params, optimizer_state, training_metrics = train_step(
@@ -419,9 +430,9 @@ def train_copy(config: CopyTrainConfig) -> None:
             aggregated_eval_metrics = {"nll": 0.0, "accuracy": 0.0}
 
             for _ in range(config.eval_steps):
-                eval_inputs, eval_targets = dataset()
+                eval_inputs, eval_targets, eval_mask = dataset()
                 eval_metrics = eval_step(
-                    model_params, eval_inputs, eval_targets, attention_mask
+                    model_params, eval_inputs, eval_targets, eval_mask
                 )
 
                 # Accumulate metrics (averaging will happen by dividing by eval_steps)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import re
 from dataclasses import dataclass
 from typing import Literal, Dict, Any
 
@@ -139,7 +141,14 @@ def train(model: BaseSequenceModel, model_cfg: ModelConfig, data_cfg: DGMConfig,
 
 	ckpt_mgr = None
 	if _ORBAX_AVAILABLE:
-		ckpt_mgr = ocp.CheckpointManager("checkpoints", ocp.PyTreeCheckpointer())
+		# Build checkpoint directory: checkpoints/{dataset_name}/{architecture_name}
+		dataset_name = "dgm"
+		# Convert model class name to snake_case (e.g., "ElmanRNN" -> "elman_rnn")
+		arch_class_name = model.__class__.__name__
+		# Convert CamelCase to snake_case
+		architecture_name = re.sub(r'(?<!^)(?=[A-Z])', '_', arch_class_name).lower()
+		checkpoint_directory = os.path.join("checkpoints", dataset_name, architecture_name)
+		ckpt_mgr = ocp.CheckpointManager(checkpoint_directory, ocp.PyTreeCheckpointer())
 
 	@jax.jit
 	def step_continuous(params, opt_state, batch):
