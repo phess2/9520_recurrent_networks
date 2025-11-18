@@ -2,16 +2,22 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
-from typing import Literal, Dict, Any
+from dataclasses import asdict
+from typing import Dict, Any
 
+import hydra
 import jax
 import jax.numpy as jnp
 import optax
 import wandb
+from omegaconf import DictConfig, OmegaConf
 
+from ..configs.schemas import OptimizerConfig, TrainLoopConfig
 from ..data.dgm_dataset import DGMDataset, DGMConfig
 from ..models.base import BaseSequenceModel, ModelConfig
+from ..models.lru import LinearRecurrentUnit
+from ..models.rnn import ElmanRNN, LSTM
+from ..models.transformer import TransformerAdapter
 
 try:
 	import orbax.checkpoint as ocp
@@ -44,56 +50,73 @@ except Exception:
 
 from ..utils.metrics import mutual_information_placeholder
 
-OptimizerName = Literal["adamw", "sgd", "muon"]
-SchedulerName = Literal["linear", "cosine"]
+MODEL_REGISTRY = {
+	"elman": ElmanRNN,
+	"lstm": LSTM,
+	"transformer": TransformerAdapter,
+	"lru": LinearRecurrentUnit,
+}
 
 
-@dataclass
-class TrainConfig:
-	project: str = "recurrent_networks_dgm"
-	run_name: str = "debug"
-	steps: int = 1000
-	log_every: int = 50
-	eval_every: int = 200
-	eval_steps: int = 10
-	ckpt_every: int = 200
-	ckpt_metric: str = "nll"  # or "accuracy"
-	save_best: bool = True
-	precision: str = "bfloat16"
-	optimizer: OptimizerName = "adamw"
-	lr: float = 3e-4
-	weight_decay: float = 0.0
-	scheduler: SchedulerName = "linear"
-	warmup_steps: int = 100
-	use_modula_optim: bool = True
-
-
-def build_optimizer(cfg: TrainConfig) -> optax.GradientTransformation:
+def build_optimizer(cfg: OptimizerConfig, total_steps: int) -> optax.GradientTransformation:
 	if cfg.scheduler == "linear":
 		schedule = optax.linear_schedule(init_value=0.0, end_value=cfg.lr, transition_steps=cfg.warmup_steps)
 	elif cfg.scheduler == "cosine":
-		schedule = optax.warmup_cosine_decay_schedule(init_value=0.0, peak_value=cfg.lr, warmup_steps=cfg.warmup_steps, decay_steps=max(cfg.steps - cfg.warmup_steps, 1), end_value=0.0)
+		schedule = optax.warmup_cosine_decay_schedule(
+			init_value=0.0,
+			peak_value=cfg.lr,
+			warmup_steps=cfg.warmup_steps,
+			decay_steps=max(total_steps - cfg.warmup_steps, 1),
+			end_value=0.0,
+		)
 	else:
 		raise ValueError(f"Unknown scheduler {cfg.scheduler}")
 
-	if cfg.optimizer == "adamw":
+	name = cfg.name.lower()
+	if name == "adamw":
 		if cfg.use_modula_optim and _MODULA_ADAMW is not None:
 			try:
 				return _MODULA_ADAMW(schedule, weight_decay=cfg.weight_decay)  # type: ignore
 			except Exception:
 				pass
-			return optax.adamw(schedule, weight_decay=cfg.weight_decay)
-	elif cfg.optimizer == "sgd":
+		return optax.adamw(schedule, weight_decay=cfg.weight_decay)
+	elif name == "sgd":
 		return optax.sgd(schedule, momentum=0.9, nesterov=True)
-	elif cfg.optimizer == "muon":
+	elif name == "muon":
 		if cfg.use_modula_optim and _MODULA_MUON is not None:
 			try:
 				return _MODULA_MUON(schedule, weight_decay=cfg.weight_decay)  # type: ignore
 			except Exception:
 				pass
-			return optax.adamw(schedule, weight_decay=cfg.weight_decay)
+		return optax.adamw(schedule, weight_decay=cfg.weight_decay)
 	else:
-		raise ValueError(f"Unknown optimizer {cfg.optimizer}")
+		raise ValueError(f"Unknown optimizer {cfg.name}")
+
+
+def build_model(model_cfg: DictConfig, train_cfg: TrainLoopConfig) -> tuple[BaseSequenceModel, ModelConfig]:
+	model_dict = OmegaConf.to_container(model_cfg, resolve=True)
+	if not isinstance(model_dict, dict):
+		raise ValueError("Model config must be a mapping.")
+	arch = str(model_dict.get("architecture", "elman")).lower()
+	input_dim = int(model_dict["input_dim"])
+	output_dim = int(model_dict["output_dim"])
+	hidden_dim = int(model_dict["hidden_dim"])
+	num_layers = int(model_dict.get("num_layers", 1))
+	precision = str(model_dict.get("precision", train_cfg.precision))
+	model_config = ModelConfig(
+		input_dim=input_dim,
+		output_dim=output_dim,
+		hidden_dim=hidden_dim,
+		num_layers=num_layers,
+		precision=precision,
+	)
+	kwargs = model_dict.get("kwargs") or {}
+	if isinstance(kwargs, DictConfig):
+		kwargs = OmegaConf.to_container(kwargs, resolve=True) or {}
+	model_cls = MODEL_REGISTRY.get(arch)
+	if model_cls is None:
+		raise ValueError(f"Unknown model architecture '{arch}'.")
+	return model_cls(model_config, **kwargs), model_config
 
 
 def compute_metrics(pred: jnp.ndarray, target: jnp.ndarray, mask: jnp.ndarray, discrete: bool) -> Dict[str, jnp.ndarray]:
@@ -129,13 +152,22 @@ def maybe_cast_precision(x: jnp.ndarray, precision: str) -> jnp.ndarray:
 	return x
 
 
-def train(model: BaseSequenceModel, model_cfg: ModelConfig, data_cfg: DGMConfig, train_cfg: TrainConfig) -> None:
-	wandb.init(project=train_cfg.project, name=train_cfg.run_name, config={"model": model_cfg.__dict__, "data": data_cfg.__dict__, "train": train_cfg.__dict__})
+def train(model: BaseSequenceModel, model_cfg: ModelConfig, data_cfg: DGMConfig, train_cfg: TrainLoopConfig, optimizer_cfg: OptimizerConfig) -> None:
+	wandb.init(
+		project=train_cfg.project,
+		name=train_cfg.run_name,
+		config={
+			"model": model_cfg.__dict__,
+			"data": data_cfg.__dict__,
+			"train": asdict(train_cfg),
+			"optimizer": asdict(optimizer_cfg),
+		},
+	)
 
 	dataset = DGMDataset(data_cfg)
-	opt = build_optimizer(train_cfg)
+	opt = build_optimizer(optimizer_cfg, train_cfg.steps)
 
-	key = jax.random.PRNGKey(0)
+	key = jax.random.PRNGKey(train_cfg.seed)
 	params = model.initialize(key)
 	opt_state = opt.init(params)
 
@@ -244,3 +276,16 @@ def train(model: BaseSequenceModel, model_cfg: ModelConfig, data_cfg: DGMConfig,
 			ckpt_mgr.save(step_idx, args={"params": params, "opt_state": opt_state})
 
 	wandb.finish()
+
+
+@hydra.main(version_base=None, config_path="../configs", config_name="dgm")
+def main(cfg: DictConfig) -> None:
+	train_cfg = TrainLoopConfig(**OmegaConf.to_container(cfg.train, resolve=True))
+	optimizer_cfg = OptimizerConfig(**OmegaConf.to_container(cfg.optimizer, resolve=True))
+	data_cfg = DGMConfig(**OmegaConf.to_container(cfg.task, resolve=True))
+	model, model_cfg = build_model(cfg.model, train_cfg)
+	train(model, model_cfg, data_cfg, train_cfg, optimizer_cfg)
+
+
+if __name__ == "__main__":
+	main()

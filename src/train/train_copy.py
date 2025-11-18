@@ -2,19 +2,20 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
-from typing import Any, Dict, Literal
+from dataclasses import asdict
+from typing import Any, Dict
 
+import hydra
 import jax
 import jax.numpy as jnp
 import optax
 import orbax.checkpoint as ocp
-
 import wandb
-
-from ..data.copy_dataset import CopyDataset
-from ..models.base import BaseSequenceModel, ModelConfig
-from ..models.rnn import ElmanRNN
+from omegaconf import DictConfig, OmegaConf
+from src.configs.schemas import OptimizerConfig, TrainLoopConfig
+from src.data.copy_dataset import CopyDataset
+from src.models.base import BaseSequenceModel, ModelConfig
+from src.models.rnn import ElmanRNN
 
 
 # Suppress Orbax checkpointing warnings about blocking main thread
@@ -32,57 +33,6 @@ class OrbaxWarningFilter(logging.Filter):
 # Apply filter to absl logger (where Orbax warnings come from)
 absl_logger = logging.getLogger("absl")
 absl_logger.addFilter(OrbaxWarningFilter())
-
-# Type aliases for optimizer and scheduler names
-OptimizerName = Literal["adamw", "sgd", "muon"]
-SchedulerName = Literal["linear", "cosine"]
-
-
-@dataclass
-class CopyTrainConfig:
-    """Configuration for training an RNN on the copy task.
-
-    The copy task tests a model's ability to remember and reproduce a sequence
-    after a delay period (lag). The lag is sampled uniformly from [min_lag, max_lag]
-    for each batch, providing a range of difficulty levels. This is a classic
-    benchmark for recurrent networks.
-    """
-
-    # Wandb logging configuration
-    project: str = "recurrent_networks_copy"
-    run_name: str = "copy_task"
-
-    # Training loop configuration
-    steps: int = 5000
-    log_every: int = 50  # Log training metrics every N steps
-    eval_every: int = 200  # Run evaluation every N steps
-    eval_steps: int = 10  # Number of batches to evaluate over
-
-    # Checkpointing configuration
-    ckpt_every: int = 500  # Save checkpoint every N steps
-    ckpt_metric: str = (
-        "accuracy"  # Metric to track for best model ("accuracy" or "nll")
-    )
-    save_best: bool = True  # Whether to save best model based on ckpt_metric
-
-    # Model precision
-    precision: str = "bfloat16"
-
-    # Optimizer configuration
-    optimizer: OptimizerName = "adamw"
-    lr: float = 1e-3  # Learning rate
-    weight_decay: float = 0.0
-    scheduler: SchedulerName = "linear"  # Learning rate schedule type
-    warmup_steps: int = 100  # Number of warmup steps for learning rate schedule
-
-    # Copy task specific hyperparameters
-    min_lag: int = 10  # Minimum delay between input sequence and target output
-    max_lag: int = 100  # Maximum delay between input sequence and target output
-    batch_size: int = 32
-    num_classes: int = 10  # Vocabulary size (number of distinct tokens)
-    embed_dim: int = 64  # Embedding dimension for token inputs
-    hidden_dim: int = 128  # Hidden dimension of the RNN
-
 
 class RNNWithEmbedding(BaseSequenceModel):
     """RNN wrapper that adds embedding layer for discrete token inputs.
@@ -143,39 +93,34 @@ class RNNWithEmbedding(BaseSequenceModel):
         return self.rnn.apply(params["rnn"], embeddings, mask)
 
 
-def build_optimizer(config: CopyTrainConfig) -> optax.GradientTransformation:
-    """Build optimizer with learning rate schedule.
-
-    Creates a learning rate schedule and wraps it with the specified optimizer.
-    """
-    # Build learning rate schedule based on configuration
+def build_optimizer(config: OptimizerConfig, total_steps: int) -> optax.GradientTransformation:
+    """Build optimizer with learning rate schedule."""
     if config.scheduler == "linear":
-        # Linear warmup from 0 to learning_rate over warmup_steps
         learning_rate_schedule = optax.linear_schedule(
             init_value=0.0, end_value=config.lr, transition_steps=config.warmup_steps
         )
     elif config.scheduler == "cosine":
-        # Cosine schedule: warmup to peak, then cosine decay to zero
         learning_rate_schedule = optax.warmup_cosine_decay_schedule(
             init_value=0.0,
             peak_value=config.lr,
             warmup_steps=config.warmup_steps,
-            decay_steps=max(config.steps - config.warmup_steps, 1),
+            decay_steps=max(total_steps - config.warmup_steps, 1),
             end_value=0.0,
         )
+    elif config.scheduler == "none":
+        learning_rate_schedule = config.lr
     else:
         raise ValueError(f"Unknown scheduler {config.scheduler}")
 
-    # Build optimizer with the learning rate schedule
-    if config.optimizer == "adamw":
+    name = config.name.lower()
+    if name == "adamw":
         return optax.adamw(learning_rate_schedule, weight_decay=config.weight_decay)
-    elif config.optimizer == "sgd":
-        # SGD with momentum and Nesterov acceleration
+    elif name == "sgd":
         return optax.sgd(learning_rate_schedule, momentum=0.9, nesterov=True)
-    elif config.optimizer == "muon":
+    elif name == "muon":
         return optax.adamw(learning_rate_schedule, weight_decay=config.weight_decay)
     else:
-        raise ValueError(f"Unknown optimizer {config.optimizer}")
+        raise ValueError(f"Unknown optimizer {config.name}")
 
 
 def compute_metrics(
@@ -250,7 +195,12 @@ def maybe_cast_precision(array: jnp.ndarray, precision: str) -> jnp.ndarray:
     return array
 
 
-def train_copy(config: CopyTrainConfig) -> None:
+def train_copy(
+    task_cfg: Dict[str, Any],
+    model_cfg: Dict[str, Any],
+    train_cfg: TrainLoopConfig,
+    optimizer_cfg: OptimizerConfig,
+) -> None:
     """Train an RNN on the copy task.
 
     The copy task requires the model to remember an input sequence and reproduce
@@ -258,36 +208,51 @@ def train_copy(config: CopyTrainConfig) -> None:
     in its hidden state over time.
     """
     # Initialize wandb for experiment tracking
-    wandb.init(project=config.project, name=config.run_name, config=config.__dict__)
+    wandb.init(
+        project=train_cfg.project,
+        name=train_cfg.run_name,
+        config={
+            "task": task_cfg,
+            "model": model_cfg,
+            "train": asdict(train_cfg),
+            "optimizer": asdict(optimizer_cfg),
+        },
+    )
 
     # Create dataset generator for the copy task
     dataset = CopyDataset(
-        min_lag=config.min_lag,
-        max_lag=config.max_lag,
-        batch_size=config.batch_size,
-        num_classes=config.num_classes,
+        min_lag=int(task_cfg["min_lag"]),
+        max_lag=int(task_cfg["max_lag"]),
+        batch_size=int(task_cfg["batch_size"]),
+        num_classes=int(task_cfg["num_classes"]),
     )
 
     # Create model configuration
     # Note: input_dim is set to embed_dim, but the actual input will be token IDs
     # which get embedded before being passed to the RNN
+    embed_dim = int(model_cfg["embed_dim"])
+    hidden_dim = int(model_cfg["hidden_dim"])
+    num_layers = int(model_cfg.get("num_layers", 1))
     model_config = ModelConfig(
-        input_dim=config.embed_dim,
-        output_dim=config.num_classes,
-        hidden_dim=config.hidden_dim,
-        precision=config.precision,
+        input_dim=embed_dim,
+        output_dim=int(task_cfg["num_classes"]),
+        hidden_dim=hidden_dim,
+        num_layers=num_layers,
+        precision=train_cfg.precision,
     )
 
     # Initialize model with embedding layer and RNN
     model = RNNWithEmbedding(
-        model_config, vocab_size=config.num_classes, embed_dim=config.embed_dim
+        model_config,
+        vocab_size=int(task_cfg["num_classes"]),
+        embed_dim=embed_dim,
     )
 
     # Build optimizer with learning rate schedule
-    optimizer = build_optimizer(config)
+    optimizer = build_optimizer(optimizer_cfg, train_cfg.steps)
 
     # Initialize model parameters and optimizer state
-    random_key = jax.random.PRNGKey(0)
+    random_key = jax.random.PRNGKey(train_cfg.seed)
     model_params = model.initialize(random_key)
     optimizer_state = optimizer.init(model_params)
 
@@ -356,7 +321,7 @@ def train_copy(config: CopyTrainConfig) -> None:
     # Track best metric value for checkpointing
     best_metric_value = None
     # Determine if higher is better (accuracy) or lower is better (NLL)
-    higher_is_better = config.ckpt_metric.lower() == "accuracy"
+    higher_is_better = train_cfg.ckpt_metric.lower() == "accuracy"
 
     def maybe_save_best(
         step_index: int, metrics: Dict[str, Any], model_params, optimizer_state
@@ -366,7 +331,7 @@ def train_copy(config: CopyTrainConfig) -> None:
         Compares current metric value to best seen value and saves if improved.
         For accuracy, higher is better; for NLL, lower is better.
         """
-        current_metric_value = float(metrics[config.ckpt_metric])
+        current_metric_value = float(metrics[train_cfg.ckpt_metric])
         nonlocal best_metric_value
 
         # Check if this is an improvement
@@ -383,10 +348,10 @@ def train_copy(config: CopyTrainConfig) -> None:
             best_metric_value = current_metric_value
 
             # Log best metric to wandb summary
-            wandb.run.summary["best_" + config.ckpt_metric] = current_metric_value
+            wandb.run.summary["best_" + train_cfg.ckpt_metric] = current_metric_value
 
             # Save checkpoint if checkpointing is enabled
-            if config.save_best and checkpoint_manager is not None:
+            if train_cfg.save_best and checkpoint_manager is not None:
                 checkpoint_manager.save(
                     step_index,
                     args=ocp.args.PyTreeSave(
@@ -399,7 +364,7 @@ def train_copy(config: CopyTrainConfig) -> None:
                 )
 
     # Main training loop
-    for step_index in range(1, config.steps + 1):
+    for step_index in range(1, train_cfg.steps + 1):
         # Get a batch of training data (now includes mask)
         input_sequence, target_sequence, attention_mask = dataset()
 
@@ -413,7 +378,7 @@ def train_copy(config: CopyTrainConfig) -> None:
         )
 
         # Log training metrics periodically
-        if step_index % config.log_every == 0:
+        if step_index % train_cfg.log_every == 0:
             wandb.log(
                 {
                     "step": step_index,
@@ -425,11 +390,11 @@ def train_copy(config: CopyTrainConfig) -> None:
             )
 
         # Run evaluation periodically
-        if step_index % config.eval_every == 0:
+        if step_index % train_cfg.eval_every == 0:
             # Aggregate metrics over multiple evaluation batches for more stable estimates
             aggregated_eval_metrics = {"nll": 0.0, "accuracy": 0.0}
 
-            for _ in range(config.eval_steps):
+            for _ in range(train_cfg.eval_steps):
                 eval_inputs, eval_targets, eval_mask = dataset()
                 eval_metrics = eval_step(
                     model_params, eval_inputs, eval_targets, eval_mask
@@ -437,10 +402,10 @@ def train_copy(config: CopyTrainConfig) -> None:
 
                 # Accumulate metrics (averaging will happen by dividing by eval_steps)
                 aggregated_eval_metrics["nll"] += (
-                    float(eval_metrics["nll"]) / config.eval_steps
+                    float(eval_metrics["nll"]) / train_cfg.eval_steps
                 )
                 aggregated_eval_metrics["accuracy"] += (
-                    float(eval_metrics["accuracy"]) / config.eval_steps
+                    float(eval_metrics["accuracy"]) / train_cfg.eval_steps
                 )
 
             # Log evaluation metrics
@@ -454,14 +419,14 @@ def train_copy(config: CopyTrainConfig) -> None:
 
             # Check if this is the best model and save if so
             metrics_for_checkpoint = {
-                config.ckpt_metric: aggregated_eval_metrics[config.ckpt_metric]
+                train_cfg.ckpt_metric: aggregated_eval_metrics[train_cfg.ckpt_metric]
             }
             maybe_save_best(
                 step_index, metrics_for_checkpoint, model_params, optimizer_state
             )
 
         # Save periodic checkpoints (not just best model)
-        if step_index % config.ckpt_every == 0 and checkpoint_manager is not None:
+        if step_index % train_cfg.ckpt_every == 0 and checkpoint_manager is not None:
             checkpoint_manager.save(
                 step_index,
                 args=ocp.args.PyTreeSave(
@@ -473,7 +438,16 @@ def train_copy(config: CopyTrainConfig) -> None:
     wandb.finish()
 
 
+@hydra.main(version_base=None, config_path="../configs", config_name="copy")
+def main(cfg: DictConfig) -> None:
+    train_cfg = TrainLoopConfig(**OmegaConf.to_container(cfg.train, resolve=True))
+    optimizer_cfg = OptimizerConfig(**OmegaConf.to_container(cfg.optimizer, resolve=True))
+    task_cfg = OmegaConf.to_container(cfg.task, resolve=True)
+    model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
+    if not isinstance(task_cfg, dict) or not isinstance(model_cfg, dict):
+        raise ValueError("Task and model configs must be mappings.")
+    train_copy(task_cfg, model_cfg, train_cfg, optimizer_cfg)
+
+
 if __name__ == "__main__":
-    # Create default configuration and start training
-    training_config = CopyTrainConfig()
-    train_copy(training_config)
+    main()
