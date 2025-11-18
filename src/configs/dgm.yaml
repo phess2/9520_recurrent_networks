@@ -1,0 +1,14 @@
+defaults:
+  - task: dgm_discrete
+  - model: dgm_elman
+  - optimizer: adamw
+  - train: dgm_default
+  - _self_
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: .
+  output_subdir: null
+

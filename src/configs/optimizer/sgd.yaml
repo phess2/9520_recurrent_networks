@@ -1,0 +1,7 @@
+name: sgd
+lr: 0.0005
+weight_decay: 0.0
+scheduler: cosine
+warmup_steps: 200
+use_modula_optim: false
+

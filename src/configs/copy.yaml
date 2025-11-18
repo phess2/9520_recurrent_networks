@@ -1,0 +1,14 @@
+defaults:
+  - task: copy
+  - model: copy_rnn
+  - optimizer: adamw
+  - train: copy_default
+  - _self_
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: .
+  output_subdir: null
+

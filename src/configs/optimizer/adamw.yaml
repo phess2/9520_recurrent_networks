@@ -1,0 +1,7 @@
+name: adamw
+lr: 0.05
+weight_decay: 0.0
+scheduler: none
+warmup_steps: 100
+use_modula_optim: true
+

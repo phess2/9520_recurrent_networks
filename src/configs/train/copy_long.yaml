@@ -1,0 +1,12 @@
+project: recurrent_networks_copy
+run_name: copy_long
+steps: 20000
+log_every: 100
+eval_every: 500
+eval_steps: 20
+ckpt_every: 1000
+ckpt_metric: accuracy
+save_best: true
+precision: bfloat16
+seed: 0
+
