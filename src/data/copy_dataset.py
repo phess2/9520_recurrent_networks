@@ -2,8 +2,11 @@ import jax
 import jax.numpy as jnp
 
 class CopyDataset:
-    def __init__(self, lag: int, batch_size: int, num_classes: int = 10):
-        self.lag = lag
+    def __init__(self, seq_length_min:int,seq_length_max:int, lag_min: int, lag_max: int, batch_size: int, num_classes: int = 10):
+        self.seq_length_min = seq_length_min
+        self.seq_length_max = seq_length_max
+        self.lag_min = lag_min
+        self.lag_max = lag_max
         self.batch_size = batch_size
         self.num_classes = num_classes
         self.key = jax.random.PRNGKey(0)
@@ -13,25 +16,55 @@ class CopyDataset:
 
     def make_copy_batch(self):
         assert self.num_classes == 10
-        length = self.lag + 20
+
         key, subkey = jax.random.split(self.key)
+
+        # Sample a single lag shared by the whole batch
+        lag_key, seq_key = jax.random.split(subkey)
+        lag = jax.random.randint(
+            lag_key,
+            shape=(),
+            minval=self.lag_min,
+            maxval=self.lag_max + 1,
+        )  # scalar, in [lag_min, lag_max] inclusive
+
+        seq_length = jax.random.randint(
+            lag_key,
+            shape=(),
+            minval=self.seq_length_min,
+            maxval=self.seq_length_max + 1,
+        )  # scalar, in [lag_min, lag_max] inclusive
 
         # initial 10-symbol sequence [batch, 10]
         init_seq = jax.random.randint(
-            subkey,
-            shape=(self.batch_size, 10),
+            seq_key,
+            shape=(self.batch_size, seq_length),
             minval=0,
             maxval=8,
         )
 
-        inputs = jnp.full((self.batch_size, length), fill_value=8, dtype=jnp.int32)
-        inputs = inputs.at[:, :10].set(init_seq)
+        # Compute length for batch: 10 + lag + 10
+        length = int(lag) + 2*seq_length
 
-        # set delimeter
-        delimiter_pos = 10 + self.lag - 1
-        inputs = inputs.at[:, delimiter_pos].set(9)
+        # Allocate buffers
+        inputs = jnp.full((self.batch_size, length), fill_value=8, dtype=jnp.int32)
         targets = jnp.full((self.batch_size, length), fill_value=9, dtype=jnp.int32)
-        copy_start = self.lag + 10
-        targets = targets.at[:, copy_start:copy_start + 10].set(init_seq)
+
+        # Process each sample in batch
+        def make_sample(i, carry):
+            inp, tgt = carry
+            seq = init_seq[i]
+            # Write sequence to input
+            inp = inp.at[i, :seq_length].set(seq)
+            # Set delimiter token at position 10+lag-1
+            delim_pos = seq_length + lag - 1
+            inp = inp.at[i, delim_pos].set(9)
+            # Write target sequence at start=10+lag, end=10+lag+10
+            tgt = tgt.at[i, seq_length + lag : seq_length + lag + seq_length].set(seq)
+            return (inp, tgt)
+
+        inputs, targets = jax.lax.fori_loop(
+            0, self.batch_size, make_sample, (inputs, targets)
+        )
 
         return inputs, targets
