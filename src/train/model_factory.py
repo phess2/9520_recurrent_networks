@@ -7,7 +7,7 @@ from omegaconf import DictConfig, OmegaConf
 from ..configs.schemas import TrainLoopConfig
 from ..models.base import BaseSequenceModel, ModelConfig
 from ..models.lru import LinearRecurrentUnit
-from ..models.rnn import ElmanRNN, LSTM
+from ..models.rnn import ElmanRNN, LSTM, UnitaryRNN
 from ..models.transformer import TransformerAdapter
 
 MODEL_REGISTRY = {
@@ -15,6 +15,7 @@ MODEL_REGISTRY = {
 	"lstm": LSTM,
 	"transformer": TransformerAdapter,
 	"lru": LinearRecurrentUnit,
+	"unitary_rnn": UnitaryRNN,
 }
 
 

@@ -1,0 +1,5 @@
+architecture: unitary_rnn
+hidden_dim: 64
+num_layers: 1
+precision: ${train.precision}
+
