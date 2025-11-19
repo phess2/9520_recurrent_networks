@@ -1,109 +1,147 @@
 from __future__ import annotations
 
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Dict, Tuple
 
 import jax
 import jax.numpy as jnp
 
 from .base import BaseSequenceModel, ModelConfig
-
-try:
-	from modula.atom import Linear
-	_MODULA_AVAILABLE = True
-except Exception:
-	_MODULA_AVAILABLE = False
+from .nonlinearities import Nonlinearity, get_nonlinearity
+from ..utils.jacobian_features import JacobianFeatureSummary, compute_jacobian_features
 
 
-def _linear_init(in_dim: int, out_dim: int):
-	if not _MODULA_AVAILABLE:
-		raise RuntimeError("Modula not available; install from https://github.com/modula-systems/modula.git")
-	lin = Linear(in_dim, out_dim)
-	lin.jit()
-	return lin
+Array = jnp.ndarray
+
+
+def _glorot_uniform(key: jax.Array, in_dim: int, out_dim: int) -> Array:
+	limit = jnp.sqrt(6.0 / (in_dim + out_dim))
+	return jax.random.uniform(key, (out_dim, in_dim), minval=-limit, maxval=limit)
+
+
+def _init_linear(key: jax.Array, in_dim: int, out_dim: int, use_bias: bool = True) -> Dict[str, Array]:
+	params: Dict[str, Array] = {"w": _glorot_uniform(key, in_dim, out_dim)}
+	if use_bias:
+		params["b"] = jnp.zeros((out_dim,), dtype=params["w"].dtype)
+	return params
+
+
+def _linear_apply(x: Array, params: Dict[str, Array]) -> Array:
+	y = x @ params["w"].T
+	if "b" in params:
+		y = y + params["b"]
+	return y
+
+
+@dataclass
+class RNNRuntimeTensors:
+	pre_activations: Array  # [B, T, H]
+	hidden_states: Array  # [B, T, H]
+	nonlinearity_jacobian_diag: Array  # [B, T, H]
 
 
 class ElmanRNN(BaseSequenceModel):
-	def __init__(self, config: ModelConfig):
+	def __init__(
+		self,
+		config: ModelConfig,
+		nonlinearity: str = "tanh",
+		nonlinearity_kwargs: Dict[str, Any] | None = None,
+	):
 		super().__init__(config)
-		# Modula Linear(in_dim, out_dim) creates weights of shape [in_dim, out_dim]
-		# But the einsum "...ij,...j->...i" expects [out_dim, in_dim]
-		# So we swap the arguments: Linear(out_dim, in_dim) creates [out_dim, in_dim]
-		self.wx = _linear_init(config.hidden_dim, config.input_dim)
-		self.wh = _linear_init(config.hidden_dim, config.hidden_dim)
-		self.wo = _linear_init(config.output_dim, config.hidden_dim)
+		self._nonlinearity: Nonlinearity = get_nonlinearity(nonlinearity, **(nonlinearity_kwargs or {}))
 
 	def initialize(self, key: jax.Array) -> Any:
-		k1, k2, k3 = jax.random.split(key, 3)
-		wx_params = self.wx.initialize(k1)
-		wh_params = self.wh.initialize(k2)
-		wo_params = self.wo.initialize(k3)
+		k1, k2, k3, _ = jax.random.split(key, 4)
 		return {
-			"wx": wx_params,
-			"wh": wh_params,
-			"wo": wo_params,
+			"wx": _init_linear(k1, self.config.input_dim, self.config.hidden_dim, use_bias=False),
+			"wh": _init_linear(k2, self.config.hidden_dim, self.config.hidden_dim, use_bias=False),
+			"bias": jnp.zeros((self.config.hidden_dim,), dtype=jnp.float32),
+			"wo": _init_linear(k3, self.config.hidden_dim, self.config.output_dim, use_bias=True),
 		}
 
-	def apply(self, params: Any, x: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
-		B, T, D = x.shape
-		h = jnp.zeros((B, self.config.hidden_dim))
+	def apply(
+		self,
+		params: Any,
+		x: jnp.ndarray,
+		mask: jnp.ndarray,
+		*,
+		return_features: bool = False,
+	) -> Tuple[jnp.ndarray, RNNRuntimeTensors] | jnp.ndarray:
+		B, _, _ = x.shape
+		H = self.config.hidden_dim
+		h0 = jnp.zeros((B, H), dtype=x.dtype)
+		bias = params["bias"]
+		act_fn = self._nonlinearity.fn
+		jac_fn = self._nonlinearity.jacobian_diag
 
-		def step(carry, inputs):
-			h = carry
-			x_t = inputs
-			a = self.wx(x_t, params["wx"]) + self.wh(h, params["wh"])
-			h = jnp.tanh(a)
-			y = self.wo(h, params["wo"])
-			return h, y
+		def step(carry, x_t):
+			h_prev = carry
+			pre = _linear_apply(x_t, params["wx"]) + _linear_apply(h_prev, params["wh"]) + bias
+			h = act_fn(pre)
+			y = _linear_apply(h, params["wo"])
+			jac_diag = jac_fn(pre)
+			return h, (y, pre, h, jac_diag)
 
-		_, ys = jax.lax.scan(step, h, x.swapaxes(0, 1))
-		return ys.swapaxes(0, 1)
+		_, (ys, pre_ts, h_ts, jac_diags) = jax.lax.scan(step, h0, x.swapaxes(0, 1))
+		output = ys.swapaxes(0, 1)
+		if not return_features:
+			return output
+		features = RNNRuntimeTensors(
+			pre_activations=pre_ts.swapaxes(0, 1),
+			hidden_states=h_ts.swapaxes(0, 1),
+			nonlinearity_jacobian_diag=jac_diags.swapaxes(0, 1),
+		)
+		return output, features
+
+	def analyze_batch(
+		self,
+		params: Any,
+		x: jnp.ndarray,
+		mask: jnp.ndarray,
+	) -> Tuple[jnp.ndarray, RNNRuntimeTensors, JacobianFeatureSummary]:
+		outputs, tensors = self.apply(params, x, mask, return_features=True)
+		wh_weight = params["wh"]["w"]
+		stats = compute_jacobian_features(tensors.nonlinearity_jacobian_diag, wh_weight, mask)
+		return outputs, tensors, stats
 
 
 class LSTM(BaseSequenceModel):
 	def __init__(self, config: ModelConfig):
 		super().__init__(config)
-		H = config.hidden_dim
-		D = config.input_dim
-		# Modula Linear(in_dim, out_dim) creates weights of shape [in_dim, out_dim]
-		# But the einsum "...ij,...j->...i" expects [out_dim, in_dim]
-		# So we swap the arguments to match the einsum convention
-		self.wxi = _linear_init(H, D)  # Input-to-hidden: want [H, D] weights
-		self.whi = _linear_init(H, H)  # Hidden-to-hidden: symmetric, stays [H, H]
-		self.wxf = _linear_init(H, D)
-		self.whf = _linear_init(H, H)
-		self.wxo = _linear_init(H, D)
-		self.who = _linear_init(H, H)
-		self.wxc = _linear_init(H, D)
-		self.whc = _linear_init(H, H)
-		self.wo = _linear_init(config.output_dim, H)  # Hidden-to-output: want [output_dim, H] weights
+		self.hidden_dim = config.hidden_dim
 
 	def initialize(self, key: jax.Array) -> Any:
+		H = self.hidden_dim
+		D = self.config.input_dim
 		keys = jax.random.split(key, 9)
 		return {
-			"wxi": self.wxi.initialize(keys[0]), "whi": self.whi.initialize(keys[1]),
-			"wxf": self.wxf.initialize(keys[2]), "whf": self.whf.initialize(keys[3]),
-			"wxo": self.wxo.initialize(keys[4]), "who": self.who.initialize(keys[5]),
-			"wxc": self.wxc.initialize(keys[6]), "whc": self.whc.initialize(keys[7]),
-			"wo": self.wo.initialize(keys[8]),
+			"wxi": _init_linear(keys[0], D, H, use_bias=True),
+			"whi": _init_linear(keys[1], H, H, use_bias=False),
+			"wxf": _init_linear(keys[2], D, H, use_bias=True),
+			"whf": _init_linear(keys[3], H, H, use_bias=False),
+			"wxo": _init_linear(keys[4], D, H, use_bias=True),
+			"who": _init_linear(keys[5], H, H, use_bias=False),
+			"wxc": _init_linear(keys[6], D, H, use_bias=True),
+			"whc": _init_linear(keys[7], H, H, use_bias=False),
+			"wo": _init_linear(keys[8], H, self.config.output_dim, use_bias=True),
 		}
 
 	def apply(self, params: Any, x: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
-		B, T, D = x.shape
-		H = self.config.hidden_dim
-		h = jnp.zeros((B, H))
-		c = jnp.zeros((B, H))
+		B, _, _ = x.shape
+		H = self.hidden_dim
+		h0 = jnp.zeros((B, H), dtype=x.dtype)
+		c0 = jnp.zeros((B, H), dtype=x.dtype)
 
-		def step(carry, inputs):
-			h, c = carry
-			x_t = inputs
-			i = jax.nn.sigmoid(self.wxi(x_t, params["wxi"]) + self.whi(h, params["whi"]))
-			f = jax.nn.sigmoid(self.wxf(x_t, params["wxf"]) + self.whf(h, params["whf"]))
-			o = jax.nn.sigmoid(self.wxo(x_t, params["wxo"]) + self.who(h, params["who"]))
-			g = jnp.tanh(self.wxc(x_t, params["wxc"]) + self.whc(h, params["whc"]))
-			c = f * c + i * g
+		def step(carry, x_t):
+			h_prev, c_prev = carry
+			i = jax.nn.sigmoid(_linear_apply(x_t, params["wxi"]) + _linear_apply(h_prev, params["whi"]))
+			f = jax.nn.sigmoid(_linear_apply(x_t, params["wxf"]) + _linear_apply(h_prev, params["whf"]))
+			o = jax.nn.sigmoid(_linear_apply(x_t, params["wxo"]) + _linear_apply(h_prev, params["who"]))
+			g = jnp.tanh(_linear_apply(x_t, params["wxc"]) + _linear_apply(h_prev, params["whc"]))
+			c = f * c_prev + i * g
 			h = o * jnp.tanh(c)
-			y = self.wo(h, params["wo"])
+			y = _linear_apply(h, params["wo"])
 			return (h, c), y
 
-		_, ys = jax.lax.scan(step, (h, c), x.swapaxes(0, 1))
+		_, ys = jax.lax.scan(step, (h0, c0), x.swapaxes(0, 1))
 		return ys.swapaxes(0, 1)

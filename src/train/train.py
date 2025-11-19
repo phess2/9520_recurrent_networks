@@ -10,6 +10,7 @@ import jax
 import jax.numpy as jnp
 import optax
 import wandb
+import numpy as np
 from omegaconf import DictConfig, OmegaConf
 
 from ..configs.schemas import OptimizerConfig, TrainLoopConfig
@@ -142,6 +143,12 @@ def train(model: BaseSequenceModel, model_cfg: ModelConfig, data_cfg: DGMConfig,
 	key = jax.random.PRNGKey(train_cfg.seed)
 	params = model.initialize(key)
 	opt_state = opt.init(params)
+	supports_feature_logging = hasattr(model, "analyze_batch")
+	feature_log_every = int(getattr(train_cfg, "feature_log_every", 0) or 0)
+	feature_log_batches = max(1, int(getattr(train_cfg, "feature_log_max_batches", 1)))
+	feature_save_dir = train_cfg.feature_save_dir
+	if feature_save_dir:
+		os.makedirs(feature_save_dir, exist_ok=True)
 
 	ckpt_mgr = None
 	if _ORBAX_AVAILABLE:
@@ -209,6 +216,57 @@ def train(model: BaseSequenceModel, model_cfg: ModelConfig, data_cfg: DGMConfig,
 	best_metric = None
 	best_is_higher = train_cfg.ckpt_metric.lower() == "accuracy"
 
+	def maybe_log_features(step_idx: int, params, batch: Dict[str, jnp.ndarray]):
+		if feature_log_every <= 0 or (step_idx % feature_log_every) != 0:
+			return
+		if not supports_feature_logging:
+			return
+		mask = batch["mask"]
+		mask_sum = 0.0
+		frob_sum = 0.0
+		active_sum = 0.0
+		scaling_sum = 0.0
+		scaling_count = 0.0
+		payload_to_save = None
+
+		def process_batch(curr_batch):
+			obs = maybe_cast_precision(curr_batch["observations"], train_cfg.precision)
+			curr_mask = curr_batch["mask"]
+			_, tensors, stats = model.analyze_batch(params, obs, curr_mask)
+			return tensors, stats, curr_mask
+
+		for idx in range(feature_log_batches):
+			curr_batch = batch if idx == 0 else dataset.sample_batch()
+			tensors, stats, curr_mask = process_batch(curr_batch)
+			curr_mask = curr_mask.astype(jnp.float32)
+			mask_sum = mask_sum + float(jnp.sum(curr_mask))
+			frob_sum = frob_sum + float(jnp.sum(stats.frobenius_norms * curr_mask))
+			active_sum = active_sum + float(jnp.sum(stats.nonlinearity_active_fraction))
+			scaling_sum = scaling_sum + float(jnp.sum(stats.nonlinearity_scaling))
+			scaling_count = scaling_count + float(jnp.sum(curr_mask) * stats.nonlinearity_scaling.shape[-1])
+			if payload_to_save is None and feature_save_dir:
+				payload_to_save = {
+					"frobenius_norms": stats.frobenius_norms,
+					"active_fraction": stats.nonlinearity_active_fraction,
+					"scaling": stats.nonlinearity_scaling,
+					"pre_activations": tensors.pre_activations,
+					"hidden_states": tensors.hidden_states,
+				}
+
+		if mask_sum <= 0:
+			return
+		eps = 1e-6
+		feature_metrics = {
+			"features/frobenius_mean": frob_sum / (mask_sum + eps),
+			"features/nonlinearity_active_fraction": active_sum / (mask_sum + eps),
+			"features/nonlinearity_scale_mean": scaling_sum / (scaling_count + eps),
+		}
+		wandb.log({"step": step_idx, **feature_metrics})
+		if payload_to_save is not None:
+			save_path = os.path.join(feature_save_dir, f"step_{step_idx:06d}.npz")
+			payload_np = jax.device_get(payload_to_save)
+			np.savez(save_path, **payload_np)
+
 	def maybe_save_best(step_idx: int, metrics: Dict[str, Any], params, opt_state):
 		now = float(metrics[train_cfg.ckpt_metric])
 		nonlocal best_metric
@@ -231,6 +289,7 @@ def train(model: BaseSequenceModel, model_cfg: ModelConfig, data_cfg: DGMConfig,
 
 		if step_idx % train_cfg.log_every == 0:
 			wandb.log({"step": step_idx, **{k: float(v) for k, v in metrics.items()}, "mi_placeholder": float(mi)})
+		maybe_log_features(step_idx, params, batch)
 
 		if step_idx % train_cfg.eval_every == 0:
 			# Evaluate over eval_steps mini-batches

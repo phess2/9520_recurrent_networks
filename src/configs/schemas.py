@@ -33,4 +33,17 @@ class TrainLoopConfig:
 	entity: str
 	seed: int = 0
 	wandb_api_key: str | None = None
+	feature_log_every: int | None = None
+	feature_log_max_batches: int = 1
+	feature_save_dir: str | None = None
+
+
+@dataclass
+class FeatureEvalConfig:
+	num_batches: int = 4
+	precision: str = "bfloat16"
+	output_dir: str = "feature_eval"
+	checkpoint_path: str | None = None
+	save_raw_tensors: bool = True
+	seed: int = 0
 

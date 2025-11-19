@@ -1,8 +1,8 @@
 defaults:
   - task: copy
   - model: rnn
-  - optimizer: adamw
   - train: copy_default
+  - eval: feature_default
   - _self_
 
 hydra:

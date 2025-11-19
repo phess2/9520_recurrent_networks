@@ -13,6 +13,7 @@ import orbax.checkpoint as ocp
 import wandb
 from omegaconf import DictConfig, OmegaConf
 import re
+import numpy as np
 from src.configs.schemas import OptimizerConfig, TrainLoopConfig
 from src.data.copy_dataset import CopyDataset
 from src.train.model_factory import build_model
@@ -171,6 +172,7 @@ def train_copy(
         max_lag=int(task_cfg["max_lag"]),
         batch_size=int(task_cfg["batch_size"]),
         num_classes=int(task_cfg["num_classes"]),
+        seq_length=int(task_cfg.get("seq_length", 10)),
     )
 
     vocab_size = int(task_cfg["num_classes"])
@@ -187,6 +189,12 @@ def train_copy(
     random_key = jax.random.PRNGKey(train_cfg.seed)
     model_params = model.initialize(random_key)
     optimizer_state = optimizer.init(model_params)
+    supports_feature_logging = hasattr(model, "analyze_batch")
+    feature_log_every = int(getattr(train_cfg, "feature_log_every", 0) or 0)
+    feature_log_batches = max(1, int(getattr(train_cfg, "feature_log_max_batches", 1)))
+    feature_save_dir = train_cfg.feature_save_dir
+    if feature_save_dir:
+        os.makedirs(feature_save_dir, exist_ok=True)
 
     # Set up checkpoint manager if orbax is available
     checkpoint_manager = None
@@ -200,6 +208,10 @@ def train_copy(
         checkpoint_directory, ocp.PyTreeCheckpointer()
     )
 
+    def embed_inputs(token_ids: jnp.ndarray) -> jnp.ndarray:
+        embedded = jax.nn.one_hot(token_ids, input_dim, dtype=jnp.float32)
+        return maybe_cast_precision(embedded, train_cfg.precision)
+
     @jax.jit
     def train_step(model_params, optimizer_state, inputs, targets, mask):
         """Single training step: forward pass, loss computation, and parameter update.
@@ -212,8 +224,7 @@ def train_copy(
 
         def loss_fn(current_params):
             """Compute loss and metrics for current parameters."""
-            embedded_inputs = jax.nn.one_hot(inputs, input_dim, dtype=jnp.float32)
-            embedded_inputs = maybe_cast_precision(embedded_inputs, train_cfg.precision)
+            embedded_inputs = embed_inputs(inputs)
 
             # Forward pass: get logits for all positions
             logits = model.apply(current_params, embedded_inputs, mask)
@@ -246,7 +257,7 @@ def train_copy(
         shifted_target_ids, shifted_target_mask = shift_targets(targets, mask)
 
         embedded_inputs = jax.nn.one_hot(inputs, input_dim, dtype=jnp.float32)
-        embedded_inputs = maybe_cast_precision(embedded_inputs, train_cfg.precision)
+        embedded_inputs = embed_inputs(inputs)
 
         # Forward pass: get predictions
         logits = model.apply(model_params, embedded_inputs, mask)
@@ -326,6 +337,7 @@ def train_copy(
                     },
                 }
             )
+        maybe_log_features(step_index, model_params, input_sequence, attention_mask)
 
         # Run evaluation periodically
         if step_index % train_cfg.eval_every == 0:
@@ -371,6 +383,67 @@ def train_copy(
                     {"params": model_params, "opt_state": optimizer_state}
                 ),
             )
+
+    def maybe_log_features(
+        step_index: int,
+        model_params,
+        input_ids: jnp.ndarray,
+        mask: jnp.ndarray,
+    ):
+        if feature_log_every <= 0 or (step_index % feature_log_every) != 0:
+            return
+        if not supports_feature_logging:
+            return
+
+        mask_total = 0.0
+        frob_sum = 0.0
+        active_sum = 0.0
+        scaling_sum = 0.0
+        scaling_count = 0.0
+        payload_to_save = None
+
+        def process(ids, mask_arr):
+            embedded = embed_inputs(ids)
+            _, tensors, stats = model.analyze_batch(model_params, embedded, mask_arr)
+            return tensors, stats
+
+        for idx in range(feature_log_batches):
+            if idx == 0:
+                ids = input_ids
+                mask_arr = mask
+            else:
+                ids, _, mask_arr = dataset()
+            tensors, stats = process(ids, mask_arr)
+            mask_arr = mask_arr.astype(jnp.float32)
+            mask_total += float(jnp.sum(mask_arr))
+            frob_sum += float(jnp.sum(stats.frobenius_norms * mask_arr))
+            active_sum += float(jnp.sum(stats.nonlinearity_active_fraction))
+            scaling_sum += float(jnp.sum(stats.nonlinearity_scaling))
+            scaling_count += float(
+                jnp.sum(mask_arr) * stats.nonlinearity_scaling.shape[-1]
+            )
+            if payload_to_save is None and feature_save_dir:
+                payload_to_save = {
+                    "frobenius_norms": stats.frobenius_norms,
+                    "active_fraction": stats.nonlinearity_active_fraction,
+                    "scaling": stats.nonlinearity_scaling,
+                    "pre_activations": tensors.pre_activations,
+                    "hidden_states": tensors.hidden_states,
+                }
+
+        if mask_total <= 0:
+            return
+        eps = 1e-6
+        feature_metrics = {
+            "features/frobenius_mean": frob_sum / (mask_total + eps),
+            "features/nonlinearity_active_fraction": active_sum / (mask_total + eps),
+            "features/nonlinearity_scale_mean": scaling_sum / (scaling_count + eps),
+        }
+        wandb.log({"step": step_index, **feature_metrics})
+        if payload_to_save is not None:
+            save_path = os.path.join(feature_save_dir, f"step_{step_index:06d}.npz")
+            payload_np = jax.device_get(payload_to_save)
+            np.savez(save_path, **payload_np)
 
     # Finalize wandb run
     wandb.finish()
