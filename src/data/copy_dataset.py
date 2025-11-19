@@ -1,8 +1,16 @@
 import jax
 import jax.numpy as jnp
 
+
 class CopyDataset:
-    def __init__(self, min_lag: int, max_lag: int, batch_size: int, num_classes: int = 10,seq_length=10):
+    def __init__(
+        self,
+        min_lag: int,
+        max_lag: int,
+        batch_size: int,
+        num_classes: int = 10,
+        seq_length=10,
+    ):
         self.min_lag = min_lag
         self.max_lag = max_lag
         self.batch_size = batch_size
@@ -26,9 +34,9 @@ class CopyDataset:
         )
         # seq_length = jax.random.randint(subkey1,shape=(),minval=10,maxval=50)
         # Actual sequence length for this batch
-        actual_length = lag + 2*self.seq_length
+        actual_length = lag + 2 * self.seq_length
         # Maximum possible length (for padding)
-        max_length = self.max_lag + 2*self.seq_length
+        max_length = self.max_lag + 2 * self.seq_length
 
         # initial 10-symbol sequence [batch, 10]
         init_seq = jax.random.randint(
@@ -40,19 +48,18 @@ class CopyDataset:
 
         # Create inputs padded to max_length
         inputs = jnp.full((self.batch_size, max_length), fill_value=8, dtype=jnp.int32)
-        inputs = inputs.at[:, :self.seq_length].set(init_seq)
+        inputs = inputs.at[:, : self.seq_length].set(init_seq)
 
         # set delimeter
-        delimiter_pos = self.seq_length+ lag - 1
+        delimiter_pos = self.seq_length + lag - 1
         inputs = inputs.at[:, delimiter_pos].set(9)
-        
+
         # Create targets padded to max_length
         targets = jnp.full((self.batch_size, max_length), fill_value=9, dtype=jnp.int32)
         copy_start = lag + self.seq_length
-        targets = targets.at[:, copy_start:copy_start + self.seq_length].set(init_seq)
+        targets = targets.at[:, copy_start : copy_start + self.seq_length].set(init_seq)
 
-        # Create attention mask: 1 for valid positions, 0 for padding
-        mask = jnp.zeros((self.batch_size, max_length), dtype=jnp.float32)
-        mask = mask.at[:, :actual_length].set(1.0)
+        # Mask: 1 only where target token is non-null (i.e., requires prediction)
+        mask = (targets != 9).astype(jnp.float32)
 
         return inputs, targets, mask

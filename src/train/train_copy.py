@@ -19,17 +19,18 @@ from src.configs.schemas import OptimizerConfig, TrainLoopConfig
 from src.models.base import ModelConfig
 from src.data.copy_dataset import CopyDataset
 from src.train.model_factory import build_model
-def _validate_precisions(model_cfg: ModelConfig, train_cfg: TrainLoopConfig) -> None:
-	if model_cfg.precision != train_cfg.precision:
-		raise ValueError(
-			f"model.precision ({model_cfg.precision}) must match train.precision ({train_cfg.precision})."
-		)
-	param_dtype = model_cfg.param_dtype or model_cfg.precision
-	if param_dtype != train_cfg.precision:
-		raise ValueError(
-			f"model.param_dtype ({param_dtype}) must match train.precision ({train_cfg.precision})."
-		)
 
+
+def _validate_precisions(model_cfg: ModelConfig, train_cfg: TrainLoopConfig) -> None:
+    if model_cfg.precision != train_cfg.precision:
+        raise ValueError(
+            f"model.precision ({model_cfg.precision}) must match train.precision ({train_cfg.precision})."
+        )
+    param_dtype = model_cfg.param_dtype or model_cfg.precision
+    if param_dtype != train_cfg.precision:
+        raise ValueError(
+            f"model.param_dtype ({param_dtype}) must match train.precision ({train_cfg.precision})."
+        )
 
 
 # Suppress Orbax checkpointing warnings about blocking main thread
@@ -48,7 +49,10 @@ class OrbaxWarningFilter(logging.Filter):
 absl_logger = logging.getLogger("absl")
 absl_logger.addFilter(OrbaxWarningFilter())
 
-def build_optimizer(config: OptimizerConfig, total_steps: int) -> optax.GradientTransformation:
+
+def build_optimizer(
+    config: OptimizerConfig, total_steps: int
+) -> optax.GradientTransformation:
     """Build optimizer with learning rate schedule."""
     if config.scheduler == "linear":
         learning_rate_schedule = optax.linear_schedule(
@@ -159,6 +163,10 @@ def _format_hms(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
+def _shift_mask(mask: jnp.ndarray) -> jnp.ndarray:
+    return jnp.concatenate([mask[:, 1:], jnp.zeros_like(mask[:, :1])], axis=1)
+
+
 def train_copy(
     task_cfg: Dict[str, Any],
     model_cfg: DictConfig,
@@ -226,7 +234,9 @@ def train_copy(
     checkpoint_manager = None
     # Build checkpoint directory: checkpoints/{dataset_name}/{architecture_name}
     dataset_name = "copy"
-    architecture_name = re.sub(r"(?<!^)(?=[A-Z])", "_", model.__class__.__name__).lower()
+    architecture_name = re.sub(
+        r"(?<!^)(?=[A-Z])", "_", model.__class__.__name__
+    ).lower()
     checkpoint_directory = os.path.abspath(
         os.path.join("checkpoints", dataset_name, architecture_name)
     )
@@ -239,7 +249,7 @@ def train_copy(
         return maybe_cast_precision(embedded, train_cfg.precision)
 
     @jax.jit
-    def train_step(model_params, optimizer_state, inputs, targets, mask):
+    def train_step(model_params, optimizer_state, inputs, targets, mask, focus_mask):
         """Single training step: forward pass, loss computation, and parameter update.
 
         For next-token prediction, we predict target[t] given inputs[0:t+1].
@@ -247,6 +257,7 @@ def train_copy(
         """
         # Shift targets for next-token prediction task
         shifted_target_ids, shifted_target_mask = shift_targets(targets, mask)
+        shifted_focus_mask = _shift_mask(focus_mask)
 
         def loss_fn(current_params):
             """Compute loss and metrics for current parameters."""
@@ -256,7 +267,8 @@ def train_copy(
             logits = model.apply(current_params, embedded_inputs, mask)
 
             # Compute metrics (NLL and accuracy)
-            metrics = compute_metrics(logits, shifted_target_ids, shifted_target_mask)
+            effective_mask = shifted_target_mask * shifted_focus_mask
+            metrics = compute_metrics(logits, shifted_target_ids, effective_mask)
 
             # Return loss (NLL) and metrics as auxiliary output
             return metrics["nll"], metrics
@@ -277,10 +289,11 @@ def train_copy(
         return model_params, optimizer_state, metrics
 
     @jax.jit
-    def eval_step(model_params, inputs, targets, mask):
+    def eval_step(model_params, inputs, targets, mask, focus_mask):
         """Single evaluation step: forward pass and metric computation (no gradients)."""
         # Shift targets for next-token prediction
         shifted_target_ids, shifted_target_mask = shift_targets(targets, mask)
+        shifted_focus_mask = _shift_mask(focus_mask)
 
         embedded_inputs = jax.nn.one_hot(inputs, input_dim, dtype=jnp.float32)
         embedded_inputs = embed_inputs(inputs)
@@ -289,7 +302,8 @@ def train_copy(
         logits = model.apply(model_params, embedded_inputs, mask)
 
         # Compute metrics
-        metrics = compute_metrics(logits, shifted_target_ids, shifted_target_mask)
+        effective_mask = shifted_target_mask * shifted_focus_mask
+        metrics = compute_metrics(logits, shifted_target_ids, effective_mask)
 
         return metrics
 
@@ -385,7 +399,9 @@ def train_copy(
                 if hasattr(tensors, "pre_activations"):
                     payload["pre_activations"] = tensors.pre_activations
                 if hasattr(tensors, "candidate_pre_activations"):
-                    payload["candidate_pre_activations"] = tensors.candidate_pre_activations
+                    payload["candidate_pre_activations"] = (
+                        tensors.candidate_pre_activations
+                    )
                 if hasattr(tensors, "hidden_states"):
                     payload["hidden_states"] = tensors.hidden_states
                 payload_to_save = payload
@@ -409,6 +425,7 @@ def train_copy(
     for step_index in range(1, train_cfg.steps + 1):
         # Get a batch of training data (now includes mask)
         input_sequence, target_sequence, attention_mask = dataset()
+        focus_mask = attention_mask
 
         # Perform one training step: forward pass, backward pass, and parameter update
         model_params, optimizer_state, training_metrics = train_step(
@@ -417,6 +434,7 @@ def train_copy(
             input_sequence,
             target_sequence,
             attention_mask,
+            focus_mask,
         )
 
         # Log training metrics periodically
@@ -439,18 +457,27 @@ def train_copy(
 
             elapsed = time.time() - start_time
             speed = elapsed / step_index if step_index > 0 else float("inf")
-            eta = (train_cfg.steps - step_index) * speed if step_index > 0 else float("inf")
+            eta = (
+                (train_cfg.steps - step_index) * speed
+                if step_index > 0
+                else float("inf")
+            )
             print(
                 f"\nStep {step_index}/{train_cfg.steps}  ({_format_hms(elapsed)} elapsed, {_format_hms(eta)} ETA)"
             )
             print(
                 "  train ┆ "
-                + " │ ".join(f"{name}: {value:.4f}" for name, value in train_stats.items())
+                + " │ ".join(
+                    f"{name}: {value:.4f}" for name, value in train_stats.items()
+                )
             )
             if last_eval_metrics:
                 print(
                     "  eval  ┆ "
-                    + " │ ".join(f"{name}: {value:.4f}" for name, value in last_eval_metrics.items())
+                    + " │ ".join(
+                        f"{name}: {value:.4f}"
+                        for name, value in last_eval_metrics.items()
+                    )
                 )
             if last_feature_metrics:
                 print(
@@ -472,7 +499,7 @@ def train_copy(
             for _ in range(train_cfg.eval_steps):
                 eval_inputs, eval_targets, eval_mask = dataset()
                 eval_metrics = eval_step(
-                    model_params, eval_inputs, eval_targets, eval_mask
+                    model_params, eval_inputs, eval_targets, eval_mask, eval_mask
                 )
 
                 # Accumulate metrics (averaging will happen by dividing by eval_steps)
@@ -581,7 +608,9 @@ def train_copy(
 @hydra.main(version_base=None, config_path="../configs", config_name="copy")
 def main(cfg: DictConfig) -> None:
     train_cfg = TrainLoopConfig(**OmegaConf.to_container(cfg.train, resolve=True))
-    optimizer_cfg = OptimizerConfig(**OmegaConf.to_container(cfg.optimizer, resolve=True))
+    optimizer_cfg = OptimizerConfig(
+        **OmegaConf.to_container(cfg.optimizer, resolve=True)
+    )
     task_cfg = OmegaConf.to_container(cfg.task, resolve=True)
     if not isinstance(task_cfg, dict):
         raise ValueError("Task config must be a mapping.")

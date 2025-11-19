@@ -1,11 +1,12 @@
 import jax
 import jax.numpy as jnp
 
+
 class BalancedParenthesesDataset:
     """
     Balanced Parentheses task dataset.
 
-    Given a sequence of tokens (parentheses and lag), the model must predict 1 if the sequence is grammatically correct (well-formed), 
+    Given a sequence of tokens (parentheses and lag), the model must predict 1 if the sequence is grammatically correct (well-formed),
     and -1 otherwise, reported only at the final position in the sequence (rest are zero / ignored in training).
 
     Args:
@@ -19,6 +20,7 @@ class BalancedParenthesesDataset:
         lag_time: time steps between end of sequence and reporting position.
         lag_noise: noise std to add during lag.
     """
+
     def __init__(
         self,
         tokens,
@@ -55,64 +57,64 @@ class BalancedParenthesesDataset:
     def make_balanced_paren_batch(self):
         # Split key for this batch
         self.key, batch_key = jax.random.split(self.key)
-        
+
         # Generate single sample (batch_size = 1)
         sample_key = batch_key
         seq_len = None  # Will be determined by generated sequence length
-        
+
         inp, tgt, msk = self._generate_single_sample(sample_key, seq_len)
-        
+
         # Return single sample with batch dimension
         inputs = inp[None, ...]
         targets = tgt[None, ...]
         masks = msk[None, ...]
-        
+
         return inputs, targets, masks
-    
+
     def _generate_single_sample(self, rng, seq_len):
         """Generate a single parentheses sample with lag period."""
         rng, subkey1 = jax.random.split(rng)
         rng, subkey2 = jax.random.split(rng)
         rng, subkey3 = jax.random.split(rng)
         rng, subkey4 = jax.random.split(rng)
-        
+
         # Decide if this sample should be valid
         is_valid = jax.random.uniform(subkey1) < self.p_valid
-        
+
         # Generate valid parentheses sequence using CFG
         sequence = self._generate_valid_sequence(subkey2)
         while len(sequence) == 0:
             rng, subkey2 = jax.random.split(rng)
             sequence = self._generate_valid_sequence(subkey2)
-        
+
         # Corrupt if needed
         if not is_valid:
             sequence = self._corrupt_sequence(sequence, subkey3)
-        
+
         # Check the actual validity of the sequence
         actual_label = self.check_balanced_parentheses(sequence)
-        
+
         # Build full input with lag period
         total_length = len(sequence) + self.lag_time
-        
+
         # Initialize with pad tokens
         input_seq = jnp.full((total_length,), self.pad_token, dtype=jnp.int32)
-        input_seq = input_seq.at[:len(sequence)].set(sequence)
-        
+        input_seq = input_seq.at[: len(sequence)].set(sequence)
+
         # Create target: only last position has the label
         target_seq = jnp.zeros((total_length,), dtype=jnp.int32)
         target_seq = target_seq.at[-1].set(actual_label)
-        
+
         # Create mask: only last position is used for loss
         mask_seq = jnp.zeros((total_length,), dtype=jnp.int32)
         mask_seq = mask_seq.at[-1].set(1)
-        
+
         return input_seq, target_seq, mask_seq
-    
+
     def _generate_valid_sequence(self, rng):
         """
         Generate a valid balanced parentheses sequence using context-free grammar.
-        
+
         Context-Free Grammar:
         S → ε | O S C S
         Where:
@@ -122,69 +124,73 @@ class BalancedParenthesesDataset:
         - C is the matching closing parenthesis for O
         - Recursive structure ensures proper nesting
         """
+
         def recursive_generate(rng, current_depth, max_depth):
             # Base case: stop recursion with probability or at max depth
             rng, uniform_key = jax.random.split(rng)
             var = jax.random.uniform(uniform_key)
-            if current_depth >= max_depth or  var < 0.1:
+            if current_depth >= max_depth or var < 0.1:
                 return [], rng
-            
+
             # Split rng for choosing open token and recursion
             rng, open_rng, subrng1, subrng2 = jax.random.split(rng, 4)
-            
+
             # Choose random open token
-            open_idx = jax.random.randint(open_rng, shape=(), minval=0, maxval=len(self.open_tokens))
+            open_idx = jax.random.randint(
+                open_rng, shape=(), minval=0, maxval=len(self.open_tokens)
+            )
             open_token = self.open_tokens[int(open_idx)]
             close_token = self.close_tokens[open_idx]
-            
+
             # Generate inner sequence S1
             inner_seq1, rng = recursive_generate(subrng1, current_depth + 1, max_depth)
-            
+
             # Generate following sequence S2
             if len(inner_seq1) + 2 < self.max_seq_length:
-                following_seq, rng = recursive_generate(subrng2, current_depth, max_depth)
+                following_seq, rng = recursive_generate(
+                    subrng2, current_depth, max_depth
+                )
                 # Build O S1 C S2
                 sequence = [open_token] + inner_seq1 + [close_token] + following_seq
             else:
                 sequence = [open_token] + inner_seq1 + [close_token]
 
             return sequence, rng
-        
+
         # Generate sequence with random depth
         rng, depth_rng = jax.random.split(rng)
-        max_depth = jax.random.randint(depth_rng, shape=(), minval=1, maxval=self.max_recursion_depth + 1)
-        
+        max_depth = jax.random.randint(
+            depth_rng, shape=(), minval=1, maxval=self.max_recursion_depth + 1
+        )
+
         sequence, _ = recursive_generate(rng, 0, int(max_depth))
-        
+
         return jnp.array(sequence, dtype=jnp.int32)
-    
+
     def _corrupt_sequence(self, sequence, rng):
         """Corrupt a valid sequence by random substitutions."""
         rng, poisson_rng, choice_rng = jax.random.split(rng, 3)
-        
+
         # Sample number of corruptions from Poisson distribution
         num_corruptions = jax.random.poisson(poisson_rng, lam=self.corruption_lambda)
         num_corruptions = jnp.minimum(num_corruptions, len(sequence))
         num_corruptions = int(num_corruptions)
-        
+
         if num_corruptions == 0:
             return sequence
-        
+
         # Choose random positions to corrupt
         seq_len = len(sequence)
         if num_corruptions >= seq_len:
             corrupt_positions = jnp.arange(seq_len)
         else:
             corrupt_positions = jax.random.choice(
-                choice_rng, 
-                jnp.arange(seq_len), 
-                shape=(num_corruptions,), 
-                replace=False
+                choice_rng, jnp.arange(seq_len), shape=(num_corruptions,), replace=False
             )
-        
+
         # Convert vocab to jax array
         vocab_array = jnp.array(self.vocab, dtype=jnp.int32)
-        
+
         # Corrupt each position
         def corrupt_single(i, carry):
             corrupted, rng = carry
@@ -194,13 +200,11 @@ class BalancedParenthesesDataset:
             new_token = jax.random.choice(subkey, vocab_array)
             corrupted = corrupted.at[pos].set(new_token)
             return corrupted, rng
-        
+
         corrupted, _ = jax.lax.fori_loop(
-            0, num_corruptions, 
-            corrupt_single, 
-            (sequence, rng)
+            0, num_corruptions, corrupt_single, (sequence, rng)
         )
-        
+
         return corrupted
 
     def check_balanced_parentheses(self, sequence):
@@ -226,6 +230,6 @@ class BalancedParenthesesDataset:
                     return -1  # Mismatched
                 stack.pop()
             # Ignore other tokens (like pad tokens)
-        
+
         # Check if all opened parentheses were closed
         return 1 if len(stack) == 0 else -1
