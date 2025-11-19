@@ -211,3 +211,7 @@ wandb/
 
 #Checkpoints
 checkpoints/
+
+# slurm logs
+outLogs/
+submit_scripts/
