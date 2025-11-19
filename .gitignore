@@ -2,7 +2,7 @@
 __pycache__/
 *.py[codz]
 *$py.class
-*.npz
+
 
 # C extensions
 *.so
@@ -212,3 +212,7 @@ wandb/
 
 #Checkpoints
 checkpoints/
+
+#other files:
+*.npz
+*.png

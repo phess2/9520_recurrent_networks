@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
 from dataclasses import asdict
-from typing import Any, Dict
+from typing import Any, Dict, List, Tuple
 
 import hydra
 import jax
@@ -15,6 +16,10 @@ import wandb
 from omegaconf import DictConfig, OmegaConf
 import re
 import numpy as np
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 from src.configs.schemas import OptimizerConfig, TrainLoopConfig
 from src.models.base import ModelConfig
 from src.data.copy_dataset import CopyDataset
@@ -48,6 +53,8 @@ class OrbaxWarningFilter(logging.Filter):
 # Apply filter to absl logger (where Orbax warnings come from)
 absl_logger = logging.getLogger("absl")
 absl_logger.addFilter(OrbaxWarningFilter())
+absl_logger.setLevel(logging.WARNING)
+logging.getLogger("absl.logging").setLevel(logging.WARNING)
 
 
 def build_optimizer(
@@ -163,10 +170,6 @@ def _format_hms(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-def _shift_mask(mask: jnp.ndarray) -> jnp.ndarray:
-    return jnp.concatenate([mask[:, 1:], jnp.zeros_like(mask[:, :1])], axis=1)
-
-
 def train_copy(
     task_cfg: Dict[str, Any],
     model_cfg: DictConfig,
@@ -206,6 +209,7 @@ def train_copy(
     )
 
     vocab_size = int(task_cfg["num_classes"])
+    num_classes = vocab_size
     input_dim = int(task_cfg.get("input_dim", vocab_size))
     output_dim = int(task_cfg.get("output_dim", vocab_size))
     task_dims = {"input_dim": input_dim, "output_dim": output_dim}
@@ -243,13 +247,18 @@ def train_copy(
     checkpoint_manager = ocp.CheckpointManager(
         checkpoint_directory, ocp.PyTreeCheckpointer()
     )
+    jacobian_plot_dir = os.path.abspath(
+        os.path.join("jacobian_plots", dataset_name, architecture_name)
+    )
+    os.makedirs(jacobian_plot_dir, exist_ok=True)
+    jacobian_eval_history: List[Dict[str, Any]] = []
 
     def embed_inputs(token_ids: jnp.ndarray) -> jnp.ndarray:
         embedded = jax.nn.one_hot(token_ids, input_dim, dtype=jnp.float32)
         return maybe_cast_precision(embedded, train_cfg.precision)
 
     @jax.jit
-    def train_step(model_params, optimizer_state, inputs, targets, mask, focus_mask):
+    def train_step(model_params, optimizer_state, inputs, targets, mask):
         """Single training step: forward pass, loss computation, and parameter update.
 
         For next-token prediction, we predict target[t] given inputs[0:t+1].
@@ -257,7 +266,6 @@ def train_copy(
         """
         # Shift targets for next-token prediction task
         shifted_target_ids, shifted_target_mask = shift_targets(targets, mask)
-        shifted_focus_mask = _shift_mask(focus_mask)
 
         def loss_fn(current_params):
             """Compute loss and metrics for current parameters."""
@@ -267,8 +275,7 @@ def train_copy(
             logits = model.apply(current_params, embedded_inputs, mask)
 
             # Compute metrics (NLL and accuracy)
-            effective_mask = shifted_target_mask * shifted_focus_mask
-            metrics = compute_metrics(logits, shifted_target_ids, effective_mask)
+            metrics = compute_metrics(logits, shifted_target_ids, shifted_target_mask)
 
             # Return loss (NLL) and metrics as auxiliary output
             return metrics["nll"], metrics
@@ -289,11 +296,10 @@ def train_copy(
         return model_params, optimizer_state, metrics
 
     @jax.jit
-    def eval_step(model_params, inputs, targets, mask, focus_mask):
+    def eval_step(model_params, inputs, targets, mask):
         """Single evaluation step: forward pass and metric computation (no gradients)."""
         # Shift targets for next-token prediction
         shifted_target_ids, shifted_target_mask = shift_targets(targets, mask)
-        shifted_focus_mask = _shift_mask(focus_mask)
 
         embedded_inputs = jax.nn.one_hot(inputs, input_dim, dtype=jnp.float32)
         embedded_inputs = embed_inputs(inputs)
@@ -302,8 +308,7 @@ def train_copy(
         logits = model.apply(model_params, embedded_inputs, mask)
 
         # Compute metrics
-        effective_mask = shifted_target_mask * shifted_focus_mask
-        metrics = compute_metrics(logits, shifted_target_ids, effective_mask)
+        metrics = compute_metrics(logits, shifted_target_ids, shifted_target_mask)
 
         return metrics
 
@@ -421,11 +426,191 @@ def train_copy(
             np.savez(save_path, **payload_np)
         return feature_metrics
 
+    def create_prediction_figure(
+        model_params,
+        input_ids: jnp.ndarray,
+        target_ids: jnp.ndarray,
+        attention_mask: jnp.ndarray,
+        example_idx: int = 0,
+    ):
+        embedded_inputs = embed_inputs(input_ids)
+        logits = model.apply(model_params, embedded_inputs, attention_mask)
+        predictions = jnp.argmax(logits, axis=-1)
+
+        inputs_np = np.asarray(jax.device_get(input_ids))
+        targets_np = np.asarray(jax.device_get(target_ids))
+        preds_np = np.asarray(jax.device_get(predictions))
+        mask_np = np.asarray(jax.device_get(attention_mask)).astype(bool)
+
+        example_idx = int(np.clip(example_idx, 0, inputs_np.shape[0] - 1))
+        inp = inputs_np[example_idx]
+        tgt = targets_np[example_idx]
+        pred = preds_np[example_idx]
+        valid = mask_np[example_idx]
+
+        fig, axes = plt.subplots(4, 1, figsize=(14, 8), sharex=True)
+        axes[0].imshow(inp[None, :], aspect="auto", cmap="tab20", vmin=0, vmax=num_classes)
+        axes[0].set_ylabel("input")
+        axes[1].imshow(tgt[None, :], aspect="auto", cmap="tab20", vmin=0, vmax=num_classes)
+        axes[1].set_ylabel("target")
+        axes[2].imshow(pred[None, :], aspect="auto", cmap="tab20", vmin=0, vmax=num_classes)
+        axes[2].set_ylabel("pred")
+        axes[3].imshow(valid[None, :].astype(float), aspect="auto", cmap="gray", vmin=0, vmax=1)
+        axes[3].set_ylabel("mask")
+        for ax in axes:
+            ax.set_yticks([])
+            ax.set_xlim(0, len(inp))
+        axes[3].set_xlabel("time step")
+        plt.tight_layout()
+
+        valid_count = np.maximum(valid.sum(), 1)
+        diff = (pred != tgt) & valid
+        sequence_accuracy = 1.0 - (diff.sum() / valid_count)
+        return fig, float(sequence_accuracy)
+
+    def log_prediction_figure(
+        step_index: int,
+        model_params,
+        input_ids: jnp.ndarray,
+        target_ids: jnp.ndarray,
+        attention_mask: jnp.ndarray,
+    ):
+        try:
+            fig, sequence_accuracy = create_prediction_figure(
+                model_params, input_ids, target_ids, attention_mask
+            )
+        except Exception:
+            logging.exception("Failed to create prediction visualization.")
+            return
+
+        caption = f"Step {step_index} - Sequence accuracy {sequence_accuracy:.3f}"
+        try:
+            wandb.run.summary["prediction_plot"] = wandb.Image(fig, caption=caption)
+        except Exception:
+            logging.exception("Failed to log prediction visualization to wandb summary.")
+        plt.close(fig)
+
+    def compute_jacobian_stats(
+        model_params,
+        input_ids: jnp.ndarray,
+        attention_mask: jnp.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        embedded = embed_inputs(input_ids)
+        full_mask = jnp.ones_like(attention_mask)
+        _, tensors, stats = model.analyze_batch(model_params, embedded, full_mask)
+        frob = np.asarray(jax.device_get(stats.frobenius_norms))
+        if frob.ndim != 2:
+            raise ValueError("Expected frobenius norms with shape [B, T].")
+        mean = np.mean(frob, axis=0)
+        std = np.std(frob, axis=0)
+        time_points = np.arange(frob.shape[1])
+        return time_points, mean, std
+
+    def log_jacobian_figure(
+        step_index: int,
+        model_params,
+        input_ids: jnp.ndarray,
+        attention_mask: jnp.ndarray,
+    ):
+        if not supports_feature_logging:
+            return
+        try:
+            time_points, mean, std = compute_jacobian_stats(
+                model_params, input_ids, attention_mask
+            )
+        except Exception:
+            logging.exception("Failed to compute jacobian statistics.")
+            return
+
+        jacobian_eval_history.append(
+            {
+                "step": int(step_index),
+                "time": time_points.tolist(),
+                "mean": mean.tolist(),
+                "std": std.tolist(),
+            }
+        )
+        mean = np.array(mean,dtype=np.float32)
+        std = np.array(std, dtype=np.float32)
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.plot(time_points, mean, label=f"Step {step_index}")
+        ax.fill_between(time_points, mean - std, mean + std, alpha=0.3)
+        ax.set_title("Jacobian Frobenius Norm Across Sequence")
+        ax.set_xlabel("Time step")
+        ax.set_ylabel("Frobenius norm")
+        ax.legend(loc="upper right")
+        ax.set_yscale("log")
+        upper = float(np.max(mean + std) + 1e-6)
+        lower = float(np.min(np.maximum(mean - std, 1e-8)))
+        lower = max(lower, 1e-8)
+        ax.set_ylim(lower, upper)
+        ax.grid(True, linestyle="--", alpha=0.3)
+        fig.tight_layout()
+
+        figure_path = os.path.join(
+            jacobian_plot_dir, f"jacobian_step_{step_index:06d}.png"
+        )
+        fig.savefig(figure_path)
+        try:
+            wandb.log(
+                {
+                    "step": step_index,
+                    "eval/jacobian_plot": wandb.Image(
+                        fig, caption=f"Jacobian norms at step {step_index}"
+                    ),
+                }
+            )
+        except Exception:
+            logging.exception("Failed to log jacobian plot to wandb.")
+        plt.close(fig)
+
+    def log_final_jacobian_summary():
+        if not jacobian_eval_history:
+            return
+        summary_path = os.path.join(jacobian_plot_dir, "jacobian_eval_history.json")
+        with open(summary_path, "w", encoding="utf-8") as fp:
+            json.dump(jacobian_eval_history, fp, indent=2)
+
+        steps = np.array([entry["step"] for entry in jacobian_eval_history])
+        all_time = np.array(jacobian_eval_history[0]["time"])
+        cmap = plt.colormaps.get_cmap("viridis")
+        norm = plt.Normalize(vmin=steps.min(), vmax=steps.max())
+
+        fig, ax = plt.subplots(figsize=(10, 5))
+        for entry in jacobian_eval_history:
+            color = cmap(norm(entry["step"]))
+            ax.plot(
+                all_time,
+                entry["mean"],
+                color=color,
+                alpha=0.9,
+                label=f"step {entry['step']}",
+            )
+        ax.set_title("Jacobian Frobenius Norm Trajectories")
+        ax.set_xlabel("Time step")
+        ax.set_ylabel("Frobenius norm (mean)")
+        sm = matplotlib.cm.ScalarMappable(cmap=cmap, norm=norm)
+        sm.set_array([])
+        fig.colorbar(sm, ax=ax, label="Training step")
+        if len(jacobian_eval_history) <= 10:
+            ax.legend(loc="upper right", fontsize="small")
+        ax.grid(True, linestyle="--", alpha=0.3)
+        fig.tight_layout()
+
+        summary_figure_path = os.path.join(jacobian_plot_dir, "jacobian_summary.png")
+        fig.savefig(summary_figure_path)
+        try:
+            wandb.run.summary["jacobian_summary_plot"] = wandb.Image(
+                fig, caption="Jacobian Frobenius trajectories"
+            )
+        except Exception:
+            logging.exception("Failed to log jacobian summary to wandb.")
+        plt.close(fig)
+
     # Main training loop
     for step_index in range(1, train_cfg.steps + 1):
         # Get a batch of training data (now includes mask)
         input_sequence, target_sequence, attention_mask = dataset()
-        focus_mask = attention_mask
 
         # Perform one training step: forward pass, backward pass, and parameter update
         model_params, optimizer_state, training_metrics = train_step(
@@ -434,7 +619,6 @@ def train_copy(
             input_sequence,
             target_sequence,
             attention_mask,
-            focus_mask,
         )
 
         # Log training metrics periodically
@@ -495,11 +679,17 @@ def train_copy(
         if step_index % train_cfg.eval_every == 0:
             # Aggregate metrics over multiple evaluation batches for more stable estimates
             aggregated_eval_metrics = {"nll": 0.0, "accuracy": 0.0}
+            prediction_batch: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray] | None = None
+            jacobian_batch: tuple[jnp.ndarray, jnp.ndarray] | None = None
 
             for _ in range(train_cfg.eval_steps):
                 eval_inputs, eval_targets, eval_mask = dataset()
+                if prediction_batch is None:
+                    prediction_batch = (eval_inputs, eval_targets, eval_mask)
+                if jacobian_batch is None:
+                    jacobian_batch = (eval_inputs, eval_mask)
                 eval_metrics = eval_step(
-                    model_params, eval_inputs, eval_targets, eval_mask, eval_mask
+                    model_params, eval_inputs, eval_targets, eval_mask
                 )
 
                 # Accumulate metrics (averaging will happen by dividing by eval_steps)
@@ -530,6 +720,8 @@ def train_copy(
                 "eval/nll": aggregated_eval_metrics["nll"],
                 "eval/accuracy": aggregated_eval_metrics["accuracy"],
             }
+            if jacobian_batch is not None:
+                log_jacobian_figure(step_index, model_params, *jacobian_batch)
 
         # Save periodic checkpoints (not just best model)
         if step_index % train_cfg.ckpt_every == 0 and checkpoint_manager is not None:
@@ -539,6 +731,13 @@ def train_copy(
                     {"params": model_params, "opt_state": optimizer_state}
                 ),
             )
+
+    # Log final prediction visualization
+    final_inputs, final_targets, final_mask = dataset()
+    log_prediction_figure(train_cfg.steps, model_params, final_inputs, final_targets, final_mask)
+    if supports_feature_logging:
+        log_jacobian_figure(train_cfg.steps, model_params, final_inputs, final_mask)
+    log_final_jacobian_summary()
 
     def maybe_log_features(
         step_index: int,

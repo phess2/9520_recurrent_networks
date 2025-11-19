@@ -1,6 +1,6 @@
 project: recurrent_networks_copy
 run_name: copy_task
-steps: 1000
+steps: 5000
 log_every: 50
 eval_every: 100
 eval_steps: 10
@@ -9,7 +9,7 @@ ckpt_metric: accuracy
 save_best: true
 precision: bfloat16
 entity: phess2-massac
-seed: 1
+seed: 0
 wandb_api_key: 172a4c57ff0779bfbe96de3da444e9851729e3d9
 feature_log_every: 500
 feature_log_max_batches: 1
