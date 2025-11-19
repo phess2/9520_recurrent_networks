@@ -7,8 +7,9 @@ defaults:
 
 hydra:
   job:
-    chdir: false
+    chdir: true
   run:
-    dir: .
-  output_subdir: null
+    dir: outputs/${now:%Y-%m-%d_%H-%M-%S}
+  sweep:
+    dir: multirun/${now:%Y-%m-%d_%H-%M-%S}
 

@@ -198,7 +198,17 @@ def train_copy(
             "optimizer": asdict(optimizer_cfg),
         },
     )
-
+    run_identifier = train_cfg.run_name or f"run_{int(time.time())}"
+    if wandb.run is not None:
+        run_identifier = wandb.run.name or wandb.run.id or run_identifier
+    run_identifier = re.sub(r"[^a-zA-Z0-9._-]", "_", run_identifier)
+    hydra_run_dir = os.environ.get("HYDRA_RUN_DIR")
+    if hydra_run_dir:
+        hydra_run_dir = os.path.abspath(hydra_run_dir)
+        os.makedirs(hydra_run_dir, exist_ok=True)
+    else:
+        hydra_run_dir = os.getcwd()
+    logging.info("Hydra run directory resolved to %s", hydra_run_dir)
     # Create dataset generator for the copy task
     dataset = CopyDataset(
         min_lag=int(task_cfg["min_lag"]),
@@ -247,8 +257,12 @@ def train_copy(
     checkpoint_manager = ocp.CheckpointManager(
         checkpoint_directory, ocp.PyTreeCheckpointer()
     )
-    jacobian_plot_dir = os.path.abspath(
-        os.path.join("jacobian_plots", dataset_name, architecture_name)
+    prediction_plot_dir = os.path.join(
+        hydra_run_dir, "prediction_plots", dataset_name, architecture_name, run_identifier
+    )
+    os.makedirs(prediction_plot_dir, exist_ok=True)
+    jacobian_plot_dir = os.path.join(
+        hydra_run_dir, "jacobian_plots", dataset_name, architecture_name, run_identifier
     )
     os.makedirs(jacobian_plot_dir, exist_ok=True)
     jacobian_eval_history: List[Dict[str, Any]] = []
@@ -488,6 +502,10 @@ def train_copy(
             wandb.run.summary["prediction_plot"] = wandb.Image(fig, caption=caption)
         except Exception:
             logging.exception("Failed to log prediction visualization to wandb summary.")
+        figure_path = os.path.join(
+            prediction_plot_dir, f"prediction_step_{step_index:06d}.png"
+        )
+        fig.savefig(figure_path)
         plt.close(fig)
 
     def compute_jacobian_stats(
