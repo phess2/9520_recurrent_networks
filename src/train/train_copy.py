@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import asdict
 from typing import Any, Dict
 
@@ -15,8 +16,20 @@ from omegaconf import DictConfig, OmegaConf
 import re
 import numpy as np
 from src.configs.schemas import OptimizerConfig, TrainLoopConfig
+from src.models.base import ModelConfig
 from src.data.copy_dataset import CopyDataset
 from src.train.model_factory import build_model
+def _validate_precisions(model_cfg: ModelConfig, train_cfg: TrainLoopConfig) -> None:
+	if model_cfg.precision != train_cfg.precision:
+		raise ValueError(
+			f"model.precision ({model_cfg.precision}) must match train.precision ({train_cfg.precision})."
+		)
+	param_dtype = model_cfg.param_dtype or model_cfg.precision
+	if param_dtype != train_cfg.precision:
+		raise ValueError(
+			f"model.param_dtype ({param_dtype}) must match train.precision ({train_cfg.precision})."
+		)
+
 
 
 # Suppress Orbax checkpointing warnings about blocking main thread
@@ -137,6 +150,15 @@ def maybe_cast_precision(array: jnp.ndarray, precision: str) -> jnp.ndarray:
     return array
 
 
+def _format_hms(seconds: float) -> str:
+    if not jnp.isfinite(seconds):
+        return "--:--:--"
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
 def train_copy(
     task_cfg: Dict[str, Any],
     model_cfg: DictConfig,
@@ -181,6 +203,7 @@ def train_copy(
     task_dims = {"input_dim": input_dim, "output_dim": output_dim}
 
     model, model_config = build_model(model_cfg, train_cfg, task_dims)
+    _validate_precisions(model_config, train_cfg)
 
     # Build optimizer with learning rate schedule
     optimizer = build_optimizer(optimizer_cfg, train_cfg.steps)
@@ -195,6 +218,9 @@ def train_copy(
     feature_save_dir = train_cfg.feature_save_dir
     if feature_save_dir:
         os.makedirs(feature_save_dir, exist_ok=True)
+    last_feature_metrics: Dict[str, float] | None = None
+    last_eval_metrics: Dict[str, float] | None = None
+    start_time = time.time()
 
     # Set up checkpoint manager if orbax is available
     checkpoint_manager = None
@@ -312,6 +338,73 @@ def train_copy(
                     ),
                 )
 
+    def maybe_log_features(
+        step_index: int,
+        model_params,
+        input_ids: jnp.ndarray,
+        mask: jnp.ndarray,
+    ):
+        if feature_log_every <= 0 or (step_index % feature_log_every) != 0:
+            return None
+        if not supports_feature_logging:
+            return None
+
+        mask_total = 0.0
+        frob_sum = 0.0
+        active_sum = 0.0
+        scaling_sum = 0.0
+        scaling_count = 0.0
+        payload_to_save = None
+
+        def process(ids, mask_arr):
+            embedded = embed_inputs(ids)
+            _, tensors, stats = model.analyze_batch(model_params, embedded, mask_arr)
+            return tensors, stats
+
+        for idx in range(feature_log_batches):
+            if idx == 0:
+                ids = input_ids
+                mask_arr = mask
+            else:
+                ids, _, mask_arr = dataset()
+            tensors, stats = process(ids, mask_arr)
+            mask_arr = mask_arr.astype(jnp.float32)
+            mask_total += float(jnp.sum(mask_arr))
+            frob_sum += float(jnp.sum(stats.frobenius_norms * mask_arr))
+            active_sum += float(jnp.sum(stats.nonlinearity_active_fraction))
+            scaling_sum += float(jnp.sum(stats.nonlinearity_scaling))
+            scaling_count += float(
+                jnp.sum(mask_arr) * stats.nonlinearity_scaling.shape[-1]
+            )
+            if payload_to_save is None and feature_save_dir:
+                payload = {
+                    "frobenius_norms": stats.frobenius_norms,
+                    "active_fraction": stats.nonlinearity_active_fraction,
+                    "scaling": stats.nonlinearity_scaling,
+                }
+                if hasattr(tensors, "pre_activations"):
+                    payload["pre_activations"] = tensors.pre_activations
+                if hasattr(tensors, "candidate_pre_activations"):
+                    payload["candidate_pre_activations"] = tensors.candidate_pre_activations
+                if hasattr(tensors, "hidden_states"):
+                    payload["hidden_states"] = tensors.hidden_states
+                payload_to_save = payload
+
+        if mask_total <= 0:
+            return None
+        eps = 1e-6
+        feature_metrics = {
+            "features/frobenius_mean": frob_sum / (mask_total + eps),
+            "features/nonlinearity_active_fraction": active_sum / (mask_total + eps),
+            "features/nonlinearity_scale_mean": scaling_sum / (scaling_count + eps),
+        }
+        wandb.log({"step": step_index, **feature_metrics})
+        if payload_to_save is not None:
+            save_path = os.path.join(feature_save_dir, f"step_{step_index:06d}.npz")
+            payload_np = jax.device_get(payload_to_save)
+            np.savez(save_path, **payload_np)
+        return feature_metrics
+
     # Main training loop
     for step_index in range(1, train_cfg.steps + 1):
         # Get a batch of training data (now includes mask)
@@ -328,16 +421,48 @@ def train_copy(
 
         # Log training metrics periodically
         if step_index % train_cfg.log_every == 0:
+            train_stats = {
+                metric_name: float(metric_value)
+                for metric_name, metric_value in training_metrics.items()
+            }
             wandb.log(
                 {
                     "step": step_index,
-                    **{
-                        metric_name: float(metric_value)
-                        for metric_name, metric_value in training_metrics.items()
-                    },
+                    **train_stats,
                 }
             )
-        maybe_log_features(step_index, model_params, input_sequence, attention_mask)
+            feature_stats = maybe_log_features(
+                step_index, model_params, input_sequence, attention_mask
+            )
+            if feature_stats is not None:
+                last_feature_metrics = feature_stats
+
+            elapsed = time.time() - start_time
+            speed = elapsed / step_index if step_index > 0 else float("inf")
+            eta = (train_cfg.steps - step_index) * speed if step_index > 0 else float("inf")
+            print(
+                f"\nStep {step_index}/{train_cfg.steps}  ({_format_hms(elapsed)} elapsed, {_format_hms(eta)} ETA)"
+            )
+            print(
+                "  train ┆ "
+                + " │ ".join(f"{name}: {value:.4f}" for name, value in train_stats.items())
+            )
+            if last_eval_metrics:
+                print(
+                    "  eval  ┆ "
+                    + " │ ".join(f"{name}: {value:.4f}" for name, value in last_eval_metrics.items())
+                )
+            if last_feature_metrics:
+                print(
+                    "  feat  ┆ "
+                    + " │ ".join(
+                        f"{name.split('/')[-1]}: {value:.4f}"
+                        for name, value in last_feature_metrics.items()
+                    )
+                )
+            print("-" * 80)
+        else:
+            maybe_log_features(step_index, model_params, input_sequence, attention_mask)
 
         # Run evaluation periodically
         if step_index % train_cfg.eval_every == 0:
@@ -374,6 +499,10 @@ def train_copy(
             maybe_save_best(
                 step_index, metrics_for_checkpoint, model_params, optimizer_state
             )
+            last_eval_metrics = {
+                "eval/nll": aggregated_eval_metrics["nll"],
+                "eval/accuracy": aggregated_eval_metrics["accuracy"],
+            }
 
         # Save periodic checkpoints (not just best model)
         if step_index % train_cfg.ckpt_every == 0 and checkpoint_manager is not None:

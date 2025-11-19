@@ -14,23 +14,51 @@ from ..utils.jacobian_features import JacobianFeatureSummary, compute_jacobian_f
 Array = jnp.ndarray
 
 
-def _glorot_uniform(key: jax.Array, in_dim: int, out_dim: int) -> Array:
+def _resolve_dtype(name: str | None) -> jnp.dtype:
+	if name is None:
+		return jnp.float32
+	name = name.lower()
+	if name in ("float32", "fp32"):
+		return jnp.float32
+	if name in ("bfloat16", "bf16"):
+		return jnp.bfloat16
+	if name in ("float16", "fp16"):
+		return jnp.float16
+	raise ValueError(f"Unsupported dtype '{name}'.")
+
+
+def _glorot_uniform(key: jax.Array, in_dim: int, out_dim: int, dtype: jnp.dtype) -> Array:
 	limit = jnp.sqrt(6.0 / (in_dim + out_dim))
-	return jax.random.uniform(key, (out_dim, in_dim), minval=-limit, maxval=limit)
+	return jax.random.uniform(key, (out_dim, in_dim), minval=-limit, maxval=limit, dtype=dtype)
 
 
-def _init_linear(key: jax.Array, in_dim: int, out_dim: int, use_bias: bool = True) -> Dict[str, Array]:
-	params: Dict[str, Array] = {"w": _glorot_uniform(key, in_dim, out_dim)}
+def _init_linear(
+	key: jax.Array,
+	in_dim: int,
+	out_dim: int,
+	use_bias: bool = True,
+	dtype: jnp.dtype = jnp.float32,
+) -> Dict[str, Array]:
+	params: Dict[str, Array] = {"w": _glorot_uniform(key, in_dim, out_dim, dtype=dtype)}
 	if use_bias:
-		params["b"] = jnp.zeros((out_dim,), dtype=params["w"].dtype)
+		params["b"] = jnp.zeros((out_dim,), dtype=dtype)
 	return params
 
 
 def _linear_apply(x: Array, params: Dict[str, Array]) -> Array:
-	y = x @ params["w"].T
+	w = params["w"]
+	y = x.astype(w.dtype) @ w.T
 	if "b" in params:
 		y = y + params["b"]
-	return y
+	return y.astype(w.dtype)
+
+
+def _layer_norm(x: Array, eps: float = 1e-5) -> Array:
+	x32 = x.astype(jnp.float32)
+	mean = jnp.mean(x32, axis=-1, keepdims=True)
+	var = jnp.mean((x32 - mean) ** 2, axis=-1, keepdims=True)
+	normed = (x32 - mean) / jnp.sqrt(var + eps)
+	return normed.astype(x.dtype)
 
 
 @dataclass
@@ -49,30 +77,24 @@ class LSTMRuntimeTensors:
 	nonlinearity_jacobian_diag: Array  # [B, T, H]
 
 
-@dataclass
-class LRURuntimeTensors:
-	pre_activations: Array  # [B, T, H]
-	hidden_states: Array  # [B, T, H]
-	nonlinearity_jacobian_diag: Array  # [B, T, H]
-
-
 class ElmanRNN(BaseSequenceModel):
 	def __init__(
 		self,
 		config: ModelConfig,
-		nonlinearity: str = "tanh",
+		nonlinearity: str = "relu",
 		nonlinearity_kwargs: Dict[str, Any] | None = None,
 	):
 		super().__init__(config)
 		self._nonlinearity: Nonlinearity = get_nonlinearity(nonlinearity, **(nonlinearity_kwargs or {}))
+		self.param_dtype = _resolve_dtype(config.param_dtype or config.precision)
+		self.use_layer_norm = config.use_layer_norm
 
 	def initialize(self, key: jax.Array) -> Any:
 		k1, k2, k3, _ = jax.random.split(key, 4)
 		return {
-			"wx": _init_linear(k1, self.config.input_dim, self.config.hidden_dim, use_bias=False),
-			"wh": _init_linear(k2, self.config.hidden_dim, self.config.hidden_dim, use_bias=False),
-			"bias": jnp.zeros((self.config.hidden_dim,), dtype=jnp.float32),
-			"wo": _init_linear(k3, self.config.hidden_dim, self.config.output_dim, use_bias=True),
+			"wx": _init_linear(k1, self.config.input_dim, self.config.hidden_dim, use_bias=True, dtype=self.param_dtype),
+			"wh": _init_linear(k2, self.config.hidden_dim, self.config.hidden_dim, use_bias=True, dtype=self.param_dtype),
+			"wo": _init_linear(k3, self.config.hidden_dim, self.config.output_dim, use_bias=True, dtype=self.param_dtype),
 		}
 
 	def apply(
@@ -85,14 +107,16 @@ class ElmanRNN(BaseSequenceModel):
 	) -> Tuple[jnp.ndarray, RNNRuntimeTensors] | jnp.ndarray:
 		B, _, _ = x.shape
 		H = self.config.hidden_dim
-		h0 = jnp.zeros((B, H), dtype=x.dtype)
-		bias = params["bias"]
+		x = x.astype(self.param_dtype)
+		h0 = jnp.zeros((B, H), dtype=self.param_dtype)
 		act_fn = self._nonlinearity.fn
 		jac_fn = self._nonlinearity.jacobian_diag
 
 		def step(carry, x_t):
 			h_prev = carry
-			pre = _linear_apply(x_t, params["wx"]) + _linear_apply(h_prev, params["wh"]) + bias
+			pre = _linear_apply(x_t, params["wx"]) + _linear_apply(h_prev, params["wh"])
+			if self.use_layer_norm:
+				pre = _layer_norm(pre)
 			h = act_fn(pre)
 			y = _linear_apply(h, params["wo"])
 			jac_diag = jac_fn(pre)
@@ -125,21 +149,23 @@ class LSTM(BaseSequenceModel):
 	def __init__(self, config: ModelConfig):
 		super().__init__(config)
 		self.hidden_dim = config.hidden_dim
+		self.param_dtype = _resolve_dtype(config.param_dtype or config.precision)
+		self.use_layer_norm = config.use_layer_norm
 
 	def initialize(self, key: jax.Array) -> Any:
 		H = self.hidden_dim
 		D = self.config.input_dim
 		keys = jax.random.split(key, 9)
 		return {
-			"wxi": _init_linear(keys[0], D, H, use_bias=True),
-			"whi": _init_linear(keys[1], H, H, use_bias=False),
-			"wxf": _init_linear(keys[2], D, H, use_bias=True),
-			"whf": _init_linear(keys[3], H, H, use_bias=False),
-			"wxo": _init_linear(keys[4], D, H, use_bias=True),
-			"who": _init_linear(keys[5], H, H, use_bias=False),
-			"wxc": _init_linear(keys[6], D, H, use_bias=True),
-			"whc": _init_linear(keys[7], H, H, use_bias=False),
-			"wo": _init_linear(keys[8], H, self.config.output_dim, use_bias=True),
+			"wxi": _init_linear(keys[0], D, H, use_bias=True, dtype=self.param_dtype),
+			"whi": _init_linear(keys[1], H, H, use_bias=True, dtype=self.param_dtype),
+			"wxf": _init_linear(keys[2], D, H, use_bias=True, dtype=self.param_dtype),
+			"whf": _init_linear(keys[3], H, H, use_bias=True, dtype=self.param_dtype),
+			"wxo": _init_linear(keys[4], D, H, use_bias=True, dtype=self.param_dtype),
+			"who": _init_linear(keys[5], H, H, use_bias=True, dtype=self.param_dtype),
+			"wxc": _init_linear(keys[6], D, H, use_bias=True, dtype=self.param_dtype),
+			"whc": _init_linear(keys[7], H, H, use_bias=True, dtype=self.param_dtype),
+			"wo": _init_linear(keys[8], H, self.config.output_dim, use_bias=True, dtype=self.param_dtype),
 		}
 
 	def apply(
@@ -152,8 +178,9 @@ class LSTM(BaseSequenceModel):
 	) -> Tuple[jnp.ndarray, LSTMRuntimeTensors] | jnp.ndarray:
 		B, _, _ = x.shape
 		H = self.hidden_dim
-		h0 = jnp.zeros((B, H), dtype=x.dtype)
-		c0 = jnp.zeros((B, H), dtype=x.dtype)
+		x = x.astype(self.param_dtype)
+		h0 = jnp.zeros((B, H), dtype=self.param_dtype)
+		c0 = jnp.zeros((B, H), dtype=self.param_dtype)
 		tanh = jnp.tanh
 
 		def step(carry, x_t):
@@ -162,6 +189,8 @@ class LSTM(BaseSequenceModel):
 			f = jax.nn.sigmoid(_linear_apply(x_t, params["wxf"]) + _linear_apply(h_prev, params["whf"]))
 			o = jax.nn.sigmoid(_linear_apply(x_t, params["wxo"]) + _linear_apply(h_prev, params["who"]))
 			pre_g = _linear_apply(x_t, params["wxc"]) + _linear_apply(h_prev, params["whc"])
+			if self.use_layer_norm:
+				pre_g = _layer_norm(pre_g)
 			g = tanh(pre_g)
 			c = f * c_prev + i * g
 			h = o * tanh(c)
@@ -206,20 +235,22 @@ class UnitaryRNN(BaseSequenceModel):
 	):
 		super().__init__(config)
 		self._nonlinearity: Nonlinearity = get_nonlinearity(nonlinearity, **(nonlinearity_kwargs or {}))
+		self.param_dtype = _resolve_dtype(config.param_dtype or config.precision)
+		self.use_layer_norm = config.use_layer_norm
 
 	def _orthogonal_matrix(self, raw: Array) -> Array:
-		q, r = jnp.linalg.qr(raw)
+		base = raw.astype(jnp.float32)
+		q, r = jnp.linalg.qr(base)
 		diag = jnp.sign(jnp.diag(r))
 		diag = jnp.where(diag == 0.0, 1.0, diag)
-		return q * diag
+		return (q * diag).astype(self.param_dtype)
 
 	def initialize(self, key: jax.Array) -> Any:
 		k1, k2, k3, _ = jax.random.split(key, 4)
 		return {
-			"wh_raw": jax.random.normal(k1, (self.config.hidden_dim, self.config.hidden_dim)),
-			"wx": _init_linear(k2, self.config.input_dim, self.config.hidden_dim, use_bias=False),
-			"wo": _init_linear(k3, self.config.hidden_dim, self.config.output_dim, use_bias=True),
-			"bias": jnp.zeros((self.config.hidden_dim,), dtype=jnp.float32),
+			"wh_raw": jax.random.normal(k1, (self.config.hidden_dim, self.config.hidden_dim), dtype=self.param_dtype),
+			"wx": _init_linear(k2, self.config.input_dim, self.config.hidden_dim, use_bias=True, dtype=self.param_dtype),
+			"wo": _init_linear(k3, self.config.hidden_dim, self.config.output_dim, use_bias=True, dtype=self.param_dtype),
 		}
 
 	def apply(
@@ -232,15 +263,17 @@ class UnitaryRNN(BaseSequenceModel):
 	) -> Tuple[jnp.ndarray, RNNRuntimeTensors] | jnp.ndarray:
 		B, _, _ = x.shape
 		H = self.config.hidden_dim
-		h0 = jnp.zeros((B, H), dtype=x.dtype)
+		x = x.astype(self.param_dtype)
+		h0 = jnp.zeros((B, H), dtype=self.param_dtype)
 		wh = self._orthogonal_matrix(params["wh_raw"])
 		act_fn = self._nonlinearity.fn
 		jac_fn = self._nonlinearity.jacobian_diag
-		bias = params["bias"]
 
 		def step(carry, x_t):
 			h_prev = carry
-			pre = _linear_apply(x_t, params["wx"]) + (h_prev @ wh.T) + bias
+			pre = _linear_apply(x_t, params["wx"]) + (h_prev @ wh.T)
+			if self.use_layer_norm:
+				pre = _layer_norm(pre)
 			h = act_fn(pre)
 			y = _linear_apply(h, params["wo"])
 			jac_diag = jac_fn(pre)

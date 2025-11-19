@@ -1,6 +1,6 @@
 defaults:
   - task: copy
-  - model: rnn
+  - model: lru
   - optimizer: adamw
   - train: copy_default
   - _self_

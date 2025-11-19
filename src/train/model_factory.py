@@ -38,6 +38,7 @@ def build_model(model_cfg: DictConfig, train_cfg: TrainLoopConfig, task_dims: Di
 	hidden_dim = int(model_dict["hidden_dim"])
 	num_layers = int(model_dict.get("num_layers", 1))
 	precision = str(model_dict.get("precision", train_cfg.precision))
+	param_dtype = str(model_dict.get("param_dtype", precision))
 
 	model_config = ModelConfig(
 		input_dim=input_dim,
@@ -45,6 +46,7 @@ def build_model(model_cfg: DictConfig, train_cfg: TrainLoopConfig, task_dims: Di
 		hidden_dim=hidden_dim,
 		num_layers=num_layers,
 		precision=precision,
+		param_dtype=param_dtype,
 	)
 
 	kwargs = model_dict.get("kwargs") or {}

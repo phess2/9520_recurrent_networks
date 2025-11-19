@@ -14,6 +14,8 @@ class ModelConfig:
 	hidden_dim: int
 	num_layers: int = 1
 	precision: str = "bfloat16"  # "float32" or "bfloat16"
+	param_dtype: str | None = None
+	use_layer_norm: bool = False
 
 
 class BaseSequenceModel:

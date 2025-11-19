@@ -2,4 +2,6 @@ architecture: lstm
 hidden_dim: 128
 num_layers: 1
 precision: ${train.precision}
+param_dtype: ${train.precision}
+use_layer_norm: false
 

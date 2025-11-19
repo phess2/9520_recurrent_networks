@@ -4,6 +4,7 @@ import os
 import re
 from dataclasses import asdict
 from typing import Dict, Any
+import time
 
 import hydra
 import jax
@@ -48,6 +49,27 @@ except Exception:
 		_MODULA_ADAMW = None
 
 from ..utils.metrics import mutual_information_placeholder
+
+
+def _validate_precisions(model_cfg: ModelConfig, train_cfg: TrainLoopConfig) -> None:
+	if model_cfg.precision != train_cfg.precision:
+		raise ValueError(
+			f"model.precision ({model_cfg.precision}) must match train.precision ({train_cfg.precision})."
+		)
+	param_dtype = model_cfg.param_dtype or model_cfg.precision
+	if param_dtype != train_cfg.precision:
+		raise ValueError(
+			f"model.param_dtype ({param_dtype}) must match train.precision ({train_cfg.precision})."
+		)
+
+
+def _format_hms(seconds: float) -> str:
+	if not jnp.isfinite(seconds):
+		return "--:--:--"
+	seconds = max(0, int(seconds))
+	h, rem = divmod(seconds, 3600)
+	m, s = divmod(rem, 60)
+	return f"{h:02d}:{m:02d}:{s:02d}"
 
 
 def build_optimizer(cfg: OptimizerConfig, total_steps: int) -> optax.GradientTransformation:
@@ -121,6 +143,7 @@ def maybe_cast_precision(x: jnp.ndarray, precision: str) -> jnp.ndarray:
 
 
 def train(model: BaseSequenceModel, model_cfg: ModelConfig, data_cfg: DGMConfig, train_cfg: TrainLoopConfig, optimizer_cfg: OptimizerConfig) -> None:
+	_validate_precisions(model_cfg, train_cfg)
 	if not train_cfg.entity:
 		raise ValueError("train.entity must be set to the target W&B team.")
 	if train_cfg.wandb_api_key:
@@ -149,6 +172,9 @@ def train(model: BaseSequenceModel, model_cfg: ModelConfig, data_cfg: DGMConfig,
 	feature_save_dir = train_cfg.feature_save_dir
 	if feature_save_dir:
 		os.makedirs(feature_save_dir, exist_ok=True)
+	last_feature_metrics: Dict[str, float] | None = None
+	last_eval_metrics: Dict[str, float] | None = None
+	start_time = time.time()
 
 	ckpt_mgr = None
 	if _ORBAX_AVAILABLE:
@@ -218,9 +244,9 @@ def train(model: BaseSequenceModel, model_cfg: ModelConfig, data_cfg: DGMConfig,
 
 	def maybe_log_features(step_idx: int, params, batch: Dict[str, jnp.ndarray]):
 		if feature_log_every <= 0 or (step_idx % feature_log_every) != 0:
-			return
+			return None
 		if not supports_feature_logging:
-			return
+			return None
 		mask = batch["mask"]
 		mask_sum = 0.0
 		frob_sum = 0.0
@@ -254,7 +280,7 @@ def train(model: BaseSequenceModel, model_cfg: ModelConfig, data_cfg: DGMConfig,
 				}
 
 		if mask_sum <= 0:
-			return
+			return None
 		eps = 1e-6
 		feature_metrics = {
 			"features/frobenius_mean": frob_sum / (mask_sum + eps),
@@ -266,6 +292,7 @@ def train(model: BaseSequenceModel, model_cfg: ModelConfig, data_cfg: DGMConfig,
 			save_path = os.path.join(feature_save_dir, f"step_{step_idx:06d}.npz")
 			payload_np = jax.device_get(payload_to_save)
 			np.savez(save_path, **payload_np)
+		return feature_metrics
 
 	def maybe_save_best(step_idx: int, metrics: Dict[str, Any], params, opt_state):
 		now = float(metrics[train_cfg.ckpt_metric])
@@ -288,8 +315,33 @@ def train(model: BaseSequenceModel, model_cfg: ModelConfig, data_cfg: DGMConfig,
 		mi = mutual_information_placeholder(batch.get("latents"), batch.get("latents"), batch["mask"])  # placeholder
 
 		if step_idx % train_cfg.log_every == 0:
-			wandb.log({"step": step_idx, **{k: float(v) for k, v in metrics.items()}, "mi_placeholder": float(mi)})
-		maybe_log_features(step_idx, params, batch)
+			train_stats = {k: float(v) for k, v in metrics.items()}
+			wandb.log({"step": step_idx, **train_stats, "mi_placeholder": float(mi)})
+			feature_stats = maybe_log_features(step_idx, params, batch)
+			if feature_stats is not None:
+				last_feature_metrics = feature_stats
+
+			elapsed = time.time() - start_time
+			speed = elapsed / step_idx if step_idx > 0 else float("inf")
+			eta = (train_cfg.steps - step_idx) * speed if step_idx > 0 else float("inf")
+			print(f"\nStep {step_idx}/{train_cfg.steps}  ({_format_hms(elapsed)} elapsed, {_format_hms(eta)} ETA)")
+			print(
+				"  train ┆ "
+				+ " │ ".join(f"{name}: {value:.4f}" for name, value in train_stats.items())
+			)
+			if last_eval_metrics:
+				print(
+					"  eval  ┆ "
+					+ " │ ".join(f"{name}: {value:.4f}" for name, value in last_eval_metrics.items())
+				)
+			if last_feature_metrics:
+				print(
+					"  feat  ┆ "
+					+ " │ ".join(f"{name.split('/')[-1]}: {value:.4f}" for name, value in last_feature_metrics.items())
+				)
+			print("-" * 80)
+		else:
+			maybe_log_features(step_idx, params, batch)
 
 		if step_idx % train_cfg.eval_every == 0:
 			# Evaluate over eval_steps mini-batches
@@ -302,6 +354,7 @@ def train(model: BaseSequenceModel, model_cfg: ModelConfig, data_cfg: DGMConfig,
 			wandb.log({"step": step_idx, "eval/nll": agg["nll"], "eval/accuracy": agg["accuracy"]})
 			metrics_for_ckpt = {train_cfg.ckpt_metric: agg[train_cfg.ckpt_metric]}
 			maybe_save_best(step_idx, metrics_for_ckpt, params, opt_state)
+			last_eval_metrics = {k: float(v) for k, v in agg.items()}
 
 		if step_idx % train_cfg.ckpt_every == 0 and ckpt_mgr is not None:
 			ckpt_mgr.save(step_idx, args={"params": params, "opt_state": opt_state})
