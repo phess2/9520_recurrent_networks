@@ -4,19 +4,11 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+from modula.atom import Linear
 
 from .base import BaseSequenceModel, ModelConfig
 
-try:
-	from modula.atom import Linear
-	_MODULA_AVAILABLE = True
-except Exception:
-	_MODULA_AVAILABLE = False
-
-
 def _linear_init(in_dim: int, out_dim: int):
-	if not _MODULA_AVAILABLE:
-		raise RuntimeError("Modula not available; install from https://github.com/modula-systems/modula.git")
 	lin = Linear(in_dim, out_dim)
 	lin.jit()
 	return lin
