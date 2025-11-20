@@ -1,8 +1,8 @@
 defaults:
-  - task: copy
+  - task: dyck
   - model: lstm
   - optimizer: adamw
-  - train: copy_default
+  - train: dyck_default
   - override hydra/launcher: submitit_slurm
   - _self_
 
@@ -23,3 +23,4 @@ hydra:
     timeout_min: 120
     submitit_folder: ${hydra.sweep.dir}/.submitit/%j
     name: ${hydra.job.name}
+
