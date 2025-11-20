@@ -10,7 +10,8 @@
 
 set -euo pipefail
 
+source /orcd/software/core/001/pkg/miniforge/24.3.0-0/etc/profile.d/conda.sh
+conda activate /home/ostrow/.conda/envs/recurrent-networks
+cd /orcd/data/fiete/001/om2/ostrow/SLT/9520_recurrent_networks
 
-conda activate recurrent_networks
-
-python -m src.train.train --config-name copy -m train.seed=0,1,2 model.hidden_dim=64,128 optimizer.lr=1e-3,5e-4
+python -m src.train.train_copy --config-name copy -m train.seed=0,1,2 model.hidden_dim=64,128 optimizer.lr=1e-3,5e-4
