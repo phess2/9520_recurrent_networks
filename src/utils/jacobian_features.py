@@ -15,6 +15,23 @@ class JacobianFeatureSummary:
     frobenius_norms: Array  # [B, T]
     nonlinearity_active_fraction: Array  # [B, T]
     nonlinearity_scaling: Array  # [B, T, H]
+    max_eigenvalue: Array  # scalar
+    max_singular_value: Array  # scalar
+
+
+def _max_eigenvalue(weight: Array) -> Array:
+    """Compute the spectral radius (max eigenvalue magnitude) of the weight matrix."""
+    weight32 = weight.astype(jnp.float32)
+    eigvals = jnp.linalg.eigvals(weight32)
+    spectral_radius = jnp.max(jnp.abs(eigvals))
+    return spectral_radius
+
+
+def _max_singular_value(weight: Array) -> Array:
+    """Compute the spectral norm (largest singular value) of the weight matrix."""
+    weight32 = weight.astype(jnp.float32)
+    singular_values = jnp.linalg.svd(weight32, full_matrices=False, compute_uv=False)
+    return jnp.max(singular_values)
 
 
 def _cumulative_jacobian_frobenius(
@@ -61,8 +78,12 @@ def compute_jacobian_features(
     frob = _cumulative_jacobian_frobenius(jac_diags, wh_weight, mask)
     active_fraction = jnp.mean(jac_diags < threshold, axis=-1) * mask
     scaling = jac_diags * mask[:, :, None]
+    lambda_max = _max_eigenvalue(wh_weight)
+    sigma_max = _max_singular_value(wh_weight)
     return JacobianFeatureSummary(
         frobenius_norms=frob,
         nonlinearity_active_fraction=active_fraction,
         nonlinearity_scaling=scaling,
+        max_eigenvalue=lambda_max,
+        max_singular_value=sigma_max,
     )

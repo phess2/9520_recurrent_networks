@@ -132,6 +132,8 @@ def evaluate(
                     "nonlinearity_scaling": stats.nonlinearity_scaling,
                     "pre_activations": tensors.pre_activations,
                     "hidden_states": tensors.hidden_states,
+                    "lambda_max": stats.max_eigenvalue,
+                    "max_singular_value": stats.max_singular_value,
                 }
             )
             save_path = os.path.join(eval_cfg.output_dir, f"batch_{batch_idx:04d}.npz")
@@ -171,6 +173,12 @@ def main(cfg: DictConfig) -> None:
             ),
             "scaling_mean": np.mean(
                 [np.mean(rec["nonlinearity_scaling"]) for rec in feature_records]
+            ),
+            "lambda_max_mean": np.mean(
+                [np.mean(rec["lambda_max"]) for rec in feature_records]
+            ),
+            "max_singular_value_mean": np.mean(
+                [np.mean(rec["max_singular_value"]) for rec in feature_records]
             ),
         }
         np.savez(summary_path, **means)

@@ -220,6 +220,8 @@ def train(
         active_sum = 0.0
         scaling_sum = 0.0
         scaling_count = 0.0
+        lambda_max_value = None
+        sigma_max_value = None
         payload_to_save = None
 
         def process_batch(curr_batch):
@@ -239,6 +241,10 @@ def train(
             scaling_count = scaling_count + float(
                 jnp.sum(curr_mask) * stats.nonlinearity_scaling.shape[-1]
             )
+            if lambda_max_value is None:
+                lambda_max_value = float(stats.max_eigenvalue)
+            if sigma_max_value is None:
+                sigma_max_value = float(stats.max_singular_value)
             if payload_to_save is None and feature_save_dir:
                 payload_to_save = {
                     "frobenius_norms": stats.frobenius_norms,
@@ -246,6 +252,8 @@ def train(
                     "scaling": stats.nonlinearity_scaling,
                     "pre_activations": tensors.pre_activations,
                     "hidden_states": tensors.hidden_states,
+                    "lambda_max": stats.max_eigenvalue,
+                    "max_singular_value": stats.max_singular_value,
                 }
 
         if mask_sum <= 0:
@@ -256,6 +264,10 @@ def train(
             "features/nonlinearity_active_fraction": active_sum / (mask_sum + eps),
             "features/nonlinearity_scale_mean": scaling_sum / (scaling_count + eps),
         }
+        if lambda_max_value is not None:
+            feature_metrics["features/lambda_max"] = lambda_max_value
+        if sigma_max_value is not None:
+            feature_metrics["features/max_singular_value"] = sigma_max_value
         wandb.log({"step": step_idx, **feature_metrics})
         if payload_to_save is not None:
             save_path = os.path.join(feature_save_dir, f"step_{step_idx:06d}.npz")

@@ -213,6 +213,10 @@ wandb/
 #Checkpoints
 checkpoints/
 
+# hydra
+outputs/
+multirun/
+
 # slurm logs
 outLogs/
 submit_scripts/
