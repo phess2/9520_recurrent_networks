@@ -213,6 +213,12 @@ wandb/
 #Checkpoints
 checkpoints/
 
+# slurm logs
+outLogs/
+submit_scripts/
+
 #other files:
 *.npz
 *.png
+
+multirun/

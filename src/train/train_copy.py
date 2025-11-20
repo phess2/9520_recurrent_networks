@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import asdict
 from typing import Any, Dict, List, Tuple
@@ -10,20 +11,21 @@ from typing import Any, Dict, List, Tuple
 import hydra
 import jax
 import jax.numpy as jnp
+import matplotlib
+import numpy as np
 import optax
 import orbax.checkpoint as ocp
-import wandb
 from omegaconf import DictConfig, OmegaConf
-import re
-import numpy as np
-import matplotlib
+
+import wandb
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from src.configs.schemas import OptimizerConfig, TrainLoopConfig
-from src.models.base import ModelConfig
-from src.data.copy_dataset import CopyDataset
-from src.train.model_factory import build_model
+
+from ..configs.schemas import OptimizerConfig, TrainLoopConfig
+from ..data.copy_dataset import CopyDataset
+from ..models.base import ModelConfig
+from .model_factory import build_model
 
 
 def _validate_precisions(model_cfg: ModelConfig, train_cfg: TrainLoopConfig) -> None:
@@ -83,8 +85,6 @@ def build_optimizer(
         return optax.adamw(learning_rate_schedule, weight_decay=config.weight_decay)
     elif name == "sgd":
         return optax.sgd(learning_rate_schedule, momentum=0.9, nesterov=True)
-    elif name == "muon":
-        return optax.adamw(learning_rate_schedule, weight_decay=config.weight_decay)
     else:
         raise ValueError(f"Unknown optimizer {config.name}")
 
@@ -244,27 +244,36 @@ def train_copy(
     last_eval_metrics: Dict[str, float] | None = None
     start_time = time.time()
 
-    # Set up checkpoint manager if orbax is available
+    # Set up checkpoint manager if orbax is available and checkpointing is enabled
     checkpoint_manager = None
     # Build checkpoint directory: checkpoints/{dataset_name}/{architecture_name}
     dataset_name = "copy"
     architecture_name = re.sub(
         r"(?<!^)(?=[A-Z])", "_", model.__class__.__name__
     ).lower()
-    checkpoint_directory = os.path.abspath(
-        os.path.join("checkpoints", dataset_name, architecture_name)
-    )
-    checkpoint_manager = ocp.CheckpointManager(
-        checkpoint_directory, ocp.PyTreeCheckpointer()
-    )
-    prediction_plot_dir = os.path.join(
-        hydra_run_dir, "prediction_plots", dataset_name, architecture_name, run_identifier
-    )
-    os.makedirs(prediction_plot_dir, exist_ok=True)
-    jacobian_plot_dir = os.path.join(
-        hydra_run_dir, "jacobian_plots", dataset_name, architecture_name, run_identifier
-    )
-    os.makedirs(jacobian_plot_dir, exist_ok=True)
+    if not train_cfg.disable_checkpointing:
+        checkpoint_directory = os.path.abspath(
+            os.path.join("checkpoints", dataset_name, architecture_name)
+        )
+        checkpoint_manager = ocp.CheckpointManager(
+            checkpoint_directory, ocp.PyTreeCheckpointer()
+        )
+    if not train_cfg.sweep_run:
+        prediction_plot_dir = os.path.join(
+            hydra_run_dir,
+            "prediction_plots",
+            dataset_name,
+            architecture_name,
+            run_identifier,
+        )
+        os.makedirs(prediction_plot_dir, exist_ok=True)
+        jacobian_plot_dir = os.path.join(
+            hydra_run_dir, "jacobian_plots", dataset_name, architecture_name, run_identifier
+        )
+        os.makedirs(jacobian_plot_dir, exist_ok=True)
+    else:
+        prediction_plot_dir = None
+        jacobian_plot_dir = None
     jacobian_eval_history: List[Dict[str, Any]] = []
 
     def embed_inputs(token_ids: jnp.ndarray) -> jnp.ndarray:
@@ -359,7 +368,11 @@ def train_copy(
             wandb.run.summary["best_" + train_cfg.ckpt_metric] = current_metric_value
 
             # Save checkpoint if checkpointing is enabled
-            if train_cfg.save_best and checkpoint_manager is not None:
+            if (
+                train_cfg.save_best
+                and not train_cfg.disable_checkpointing
+                and checkpoint_manager is not None
+            ):
                 checkpoint_manager.save(
                     step_index,
                     args=ocp.args.PyTreeSave(
@@ -377,6 +390,8 @@ def train_copy(
         input_ids: jnp.ndarray,
         mask: jnp.ndarray,
     ):
+        if train_cfg.sweep_run:
+            return None
         if feature_log_every <= 0 or (step_index % feature_log_every) != 0:
             return None
         if not supports_feature_logging:
@@ -463,13 +478,21 @@ def train_copy(
         valid = mask_np[example_idx]
 
         fig, axes = plt.subplots(4, 1, figsize=(14, 8), sharex=True)
-        axes[0].imshow(inp[None, :], aspect="auto", cmap="tab20", vmin=0, vmax=num_classes)
+        axes[0].imshow(
+            inp[None, :], aspect="auto", cmap="tab20", vmin=0, vmax=num_classes
+        )
         axes[0].set_ylabel("input")
-        axes[1].imshow(tgt[None, :], aspect="auto", cmap="tab20", vmin=0, vmax=num_classes)
+        axes[1].imshow(
+            tgt[None, :], aspect="auto", cmap="tab20", vmin=0, vmax=num_classes
+        )
         axes[1].set_ylabel("target")
-        axes[2].imshow(pred[None, :], aspect="auto", cmap="tab20", vmin=0, vmax=num_classes)
+        axes[2].imshow(
+            pred[None, :], aspect="auto", cmap="tab20", vmin=0, vmax=num_classes
+        )
         axes[2].set_ylabel("pred")
-        axes[3].imshow(valid[None, :].astype(float), aspect="auto", cmap="gray", vmin=0, vmax=1)
+        axes[3].imshow(
+            valid[None, :].astype(float), aspect="auto", cmap="gray", vmin=0, vmax=1
+        )
         axes[3].set_ylabel("mask")
         for ax in axes:
             ax.set_yticks([])
@@ -501,7 +524,9 @@ def train_copy(
         try:
             wandb.run.summary["prediction_plot"] = wandb.Image(fig, caption=caption)
         except Exception:
-            logging.exception("Failed to log prediction visualization to wandb summary.")
+            logging.exception(
+                "Failed to log prediction visualization to wandb summary."
+            )
         figure_path = os.path.join(
             prediction_plot_dir, f"prediction_step_{step_index:06d}.png"
         )
@@ -548,7 +573,7 @@ def train_copy(
                 "std": std.tolist(),
             }
         )
-        mean = np.array(mean,dtype=np.float32)
+        mean = np.array(mean, dtype=np.float32)
         std = np.array(std, dtype=np.float32)
         fig, ax = plt.subplots(figsize=(10, 5))
         ax.plot(time_points, mean, label=f"Step {step_index}")
@@ -738,11 +763,15 @@ def train_copy(
                 "eval/nll": aggregated_eval_metrics["nll"],
                 "eval/accuracy": aggregated_eval_metrics["accuracy"],
             }
-            if jacobian_batch is not None:
+            if jacobian_batch is not None and not train_cfg.sweep_run:
                 log_jacobian_figure(step_index, model_params, *jacobian_batch)
 
         # Save periodic checkpoints (not just best model)
-        if step_index % train_cfg.ckpt_every == 0 and checkpoint_manager is not None:
+        if (
+            step_index % train_cfg.ckpt_every == 0
+            and not train_cfg.disable_checkpointing
+            and checkpoint_manager is not None
+        ):
             checkpoint_manager.save(
                 step_index,
                 args=ocp.args.PyTreeSave(
@@ -751,11 +780,14 @@ def train_copy(
             )
 
     # Log final prediction visualization
-    final_inputs, final_targets, final_mask = dataset()
-    log_prediction_figure(train_cfg.steps, model_params, final_inputs, final_targets, final_mask)
-    if supports_feature_logging:
-        log_jacobian_figure(train_cfg.steps, model_params, final_inputs, final_mask)
-    log_final_jacobian_summary()
+    if not train_cfg.sweep_run:
+        final_inputs, final_targets, final_mask = dataset()
+        log_prediction_figure(
+            train_cfg.steps, model_params, final_inputs, final_targets, final_mask
+        )
+        if supports_feature_logging:
+            log_jacobian_figure(train_cfg.steps, model_params, final_inputs, final_mask)
+        log_final_jacobian_summary()
 
     def maybe_log_features(
         step_index: int,

@@ -36,6 +36,8 @@ class TrainLoopConfig:
     feature_log_every: int | None = None
     feature_log_max_batches: int = 1
     feature_save_dir: str | None = None
+    disable_checkpointing: bool = False
+    sweep_run: bool = False
 
 
 @dataclass

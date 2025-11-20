@@ -18,40 +18,7 @@ from ..configs.schemas import OptimizerConfig, TrainLoopConfig
 from ..data.dgm_dataset import DGMDataset, DGMConfig
 from ..models.base import BaseSequenceModel, ModelConfig
 from .model_factory import build_model
-
-try:
-    import orbax.checkpoint as ocp
-
-    _ORBAX_AVAILABLE = True
-except Exception:
-    _ORBAX_AVAILABLE = False
-
-# Try to import Modula optimizers if present
-_MODULA_MUON = None
-_MODULA_ADAMW = None
-try:
-    from modula.optimize import muon as _muon  # type: ignore
-
-    _MODULA_MUON = _muon
-except Exception:
-    try:
-        from modula.optimizer import muon as _muon  # type: ignore
-
-        _MODULA_MUON = _muon
-    except Exception:
-        _MODULA_MUON = None
-
-try:
-    from modula.optimize import adamw as _madamw  # type: ignore
-
-    _MODULA_ADAMW = _madamw
-except Exception:
-    try:
-        from modula.optimizer import adamw as _madamw  # type: ignore
-
-        _MODULA_ADAMW = _madamw
-    except Exception:
-        _MODULA_ADAMW = None
+import orbax.checkpoint as ocp
 
 from ..utils.metrics import mutual_information_placeholder
 
@@ -99,21 +66,9 @@ def build_optimizer(
 
     name = cfg.name.lower()
     if name == "adamw":
-        if cfg.use_modula_optim and _MODULA_ADAMW is not None:
-            try:
-                return _MODULA_ADAMW(schedule, weight_decay=cfg.weight_decay)  # type: ignore
-            except Exception:
-                pass
         return optax.adamw(schedule, weight_decay=cfg.weight_decay)
     elif name == "sgd":
         return optax.sgd(schedule, momentum=0.9, nesterov=True)
-    elif name == "muon":
-        if cfg.use_modula_optim and _MODULA_MUON is not None:
-            try:
-                return _MODULA_MUON(schedule, weight_decay=cfg.weight_decay)  # type: ignore
-            except Exception:
-                pass
-        return optax.adamw(schedule, weight_decay=cfg.weight_decay)
     else:
         raise ValueError(f"Unknown optimizer {cfg.name}")
 
@@ -194,17 +149,8 @@ def train(
     start_time = time.time()
 
     ckpt_mgr = None
-    if _ORBAX_AVAILABLE:
-        # Build checkpoint directory: checkpoints/{dataset_name}/{architecture_name}
-        dataset_name = "dgm"
-        # Convert model class name to snake_case (e.g., "ElmanRNN" -> "elman_rnn")
-        arch_class_name = model.__class__.__name__
-        # Convert CamelCase to snake_case
-        architecture_name = re.sub(r"(?<!^)(?=[A-Z])", "_", arch_class_name).lower()
-        checkpoint_directory = os.path.join(
-            "checkpoints", dataset_name, architecture_name
-        )
-        ckpt_mgr = ocp.CheckpointManager(checkpoint_directory, ocp.PyTreeCheckpointer())
+    checkpoint_directory = os.path.join("checkpoints", train_cfg.project, train_cfg.run_name)
+    ckpt_mgr = ocp.CheckpointManager(checkpoint_directory, ocp.PyTreeCheckpointer())
 
     @jax.jit
     def step_continuous(params, opt_state, batch):
@@ -326,7 +272,7 @@ def train(
         if improved:
             best_metric = now
             wandb.run.summary["best_" + train_cfg.ckpt_metric] = now
-            if _ORBAX_AVAILABLE and train_cfg.save_best and ckpt_mgr is not None:
+            if train_cfg.save_best and ckpt_mgr is not None:
                 ckpt_mgr.save(
                     step_idx,
                     args={

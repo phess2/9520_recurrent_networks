@@ -6,33 +6,44 @@ from typing import Any, Dict, Tuple
 import jax
 import jax.numpy as jnp
 
+from ..utils.jacobian_features import JacobianFeatureSummary, compute_jacobian_features
 from .base import BaseSequenceModel, ModelConfig
 from .nonlinearities import Nonlinearity, get_nonlinearity
-from ..utils.jacobian_features import JacobianFeatureSummary, compute_jacobian_features
-
 
 Array = jnp.ndarray
 
 
-def _resolve_dtype(name: str | None) -> jnp.dtype:
-    if name is None:
+def _resolve_dtype(dtype_name: str | None) -> jnp.dtype:
+    """
+    Converts a string dtype name to the corresponding JAX numpy dtype.
+    Returns float32 by default if dtype_name is None.
+    """
+    if dtype_name is None:
         return jnp.float32
-    name = name.lower()
-    if name in ("float32", "fp32"):
+    dtype_name = dtype_name.lower()
+    if dtype_name in ("float32", "fp32"):
         return jnp.float32
-    if name in ("bfloat16", "bf16"):
+    if dtype_name in ("bfloat16", "bf16"):
         return jnp.bfloat16
-    if name in ("float16", "fp16"):
+    if dtype_name in ("float16", "fp16"):
         return jnp.float16
-    raise ValueError(f"Unsupported dtype '{name}'.")
+    raise ValueError(f"Unsupported dtype '{dtype_name}'.")
 
 
 def _glorot_uniform(
     key: jax.Array, in_dim: int, out_dim: int, dtype: jnp.dtype
 ) -> Array:
-    limit = jnp.sqrt(6.0 / (in_dim + out_dim))
+    """
+    Initializes a weight matrix using Glorot (Xavier) uniform initialization.
+    This helps maintain variance of activations and gradients across layers.
+    """
+    initialization_limit = jnp.sqrt(6.0 / (in_dim + out_dim))
     return jax.random.uniform(
-        key, (out_dim, in_dim), minval=-limit, maxval=limit, dtype=dtype
+        key,
+        (out_dim, in_dim),
+        minval=-initialization_limit,
+        maxval=initialization_limit,
+        dtype=dtype,
     )
 
 
@@ -43,30 +54,49 @@ def _init_linear(
     use_bias: bool = True,
     dtype: jnp.dtype = jnp.float32,
 ) -> Dict[str, Array]:
-    params: Dict[str, Array] = {"w": _glorot_uniform(key, in_dim, out_dim, dtype=dtype)}
+    """
+    Initializes parameters for a linear (fully-connected) layer.
+    Returns a dictionary with weight matrix 'w' and optionally bias vector 'b'.
+    """
+    parameters: Dict[str, Array] = {
+        "w": _glorot_uniform(key, in_dim, out_dim, dtype=dtype)
+    }
     if use_bias:
-        params["b"] = jnp.zeros((out_dim,), dtype=dtype)
-    return params
+        parameters["b"] = jnp.zeros((out_dim,), dtype=dtype)
+    return parameters
 
 
-def _linear_apply(x: Array, params: Dict[str, Array]) -> Array:
-    w = params["w"]
-    y = x.astype(w.dtype) @ w.T
-    if "b" in params:
-        y = y + params["b"]
-    return y.astype(w.dtype)
+def _linear_apply(input_tensor: Array, parameters: Dict[str, Array]) -> Array:
+    """
+    Applies a linear transformation: output = input @ weight^T + bias.
+    Handles dtype casting to match the weight matrix dtype.
+    """
+    weight_matrix = parameters["w"]
+    output = input_tensor.astype(weight_matrix.dtype) @ weight_matrix.T
+    if "b" in parameters:
+        output = output + parameters["b"]
+    return output.astype(weight_matrix.dtype)
 
 
-def _layer_norm(x: Array, eps: float = 1e-5) -> Array:
-    x32 = x.astype(jnp.float32)
-    mean = jnp.mean(x32, axis=-1, keepdims=True)
-    var = jnp.mean((x32 - mean) ** 2, axis=-1, keepdims=True)
-    normed = (x32 - mean) / jnp.sqrt(var + eps)
-    return normed.astype(x.dtype)
+def _layer_norm(input_tensor: Array, epsilon: float = 1e-5) -> Array:
+    """
+    Applies layer normalization: (x - mean) / sqrt(variance + epsilon).
+    Normalizes across the last dimension, maintaining the original dtype.
+    """
+    input_float32 = input_tensor.astype(jnp.float32)
+    mean_value = jnp.mean(input_float32, axis=-1, keepdims=True)
+    variance = jnp.mean((input_float32 - mean_value) ** 2, axis=-1, keepdims=True)
+    normalized = (input_float32 - mean_value) / jnp.sqrt(variance + epsilon)
+    return normalized.astype(input_tensor.dtype)
 
 
 @dataclass
 class RNNRuntimeTensors:
+    """
+    Runtime tensors captured during RNN forward pass for analysis.
+    All arrays have shape [batch_size, sequence_length, hidden_dim].
+    """
+
     pre_activations: Array  # [B, T, H]
     hidden_states: Array  # [B, T, H]
     nonlinearity_jacobian_diag: Array  # [B, T, H]
@@ -74,6 +104,11 @@ class RNNRuntimeTensors:
 
 @dataclass
 class LSTMRuntimeTensors:
+    """
+    Runtime tensors captured during LSTM forward pass for analysis.
+    All arrays have shape [batch_size, sequence_length, hidden_dim].
+    """
+
     candidate_pre_activations: Array  # [B, T, H]
     candidate_states: Array  # [B, T, H]
     input_gates: Array  # [B, T, H]
@@ -82,12 +117,20 @@ class LSTMRuntimeTensors:
 
 
 class ElmanRNN(BaseSequenceModel):
+    """
+    Standard Elman RNN (vanilla RNN) with configurable activation function.
+    Uses input-to-hidden, hidden-to-hidden, and hidden-to-output weight matrices.
+    """
+
     def __init__(
         self,
         config: ModelConfig,
         nonlinearity: str = "relu",
         nonlinearity_kwargs: Dict[str, Any] | None = None,
     ):
+        """
+        Initializes ElmanRNN with specified configuration and activation function.
+        """
         super().__init__(config)
         self._nonlinearity: Nonlinearity = get_nonlinearity(
             nonlinearity, **(nonlinearity_kwargs or {})
@@ -96,24 +139,30 @@ class ElmanRNN(BaseSequenceModel):
         self.use_layer_norm = config.use_layer_norm
 
     def initialize(self, key: jax.Array) -> Any:
-        k1, k2, k3, _ = jax.random.split(key, 4)
+        """
+        Initializes all model parameters using Glorot uniform initialization.
+        Creates separate random keys for each weight matrix to ensure independence.
+        """
+        input_to_hidden_key, hidden_to_hidden_key, hidden_to_output_key, _ = (
+            jax.random.split(key, 4)
+        )
         return {
             "wx": _init_linear(
-                k1,
+                input_to_hidden_key,
                 self.config.input_dim,
                 self.config.hidden_dim,
                 use_bias=True,
                 dtype=self.param_dtype,
             ),
             "wh": _init_linear(
-                k2,
+                hidden_to_hidden_key,
                 self.config.hidden_dim,
                 self.config.hidden_dim,
                 use_bias=True,
                 dtype=self.param_dtype,
             ),
             "wo": _init_linear(
-                k3,
+                hidden_to_output_key,
                 self.config.hidden_dim,
                 self.config.output_dim,
                 use_bias=True,
@@ -129,31 +178,53 @@ class ElmanRNN(BaseSequenceModel):
         *,
         return_features: bool = False,
     ) -> Tuple[jnp.ndarray, RNNRuntimeTensors] | jnp.ndarray:
-        B, _, _ = x.shape
-        H = self.config.hidden_dim
-        x = x.astype(self.param_dtype)
-        h0 = jnp.zeros((B, H), dtype=self.param_dtype)
-        act_fn = self._nonlinearity.fn
-        jac_fn = self._nonlinearity.jacobian_diag
+        """
+        Forward pass through the Elman RNN.
+        Processes the input sequence step-by-step, updating hidden states and producing outputs.
+        """
+        batch_size, _, _ = x.shape
+        hidden_dim = self.config.hidden_dim
+        input_sequence = x.astype(self.param_dtype)
+        initial_hidden_state = jnp.zeros(
+            (batch_size, hidden_dim), dtype=self.param_dtype
+        )
+        activation_function = self._nonlinearity.fn
+        jacobian_function = self._nonlinearity.jacobian_diag
 
-        def step(carry, x_t):
-            h_prev = carry
-            pre = _linear_apply(x_t, params["wx"]) + _linear_apply(h_prev, params["wh"])
+        def step(carry, current_input):
+            """
+            Single RNN step: combines input and previous hidden state,
+            applies activation, and produces output for this timestep.
+            """
+            previous_hidden_state = carry
+            # Combine input projection and hidden-to-hidden projection
+            pre_activation = _linear_apply(current_input, params["wx"]) + _linear_apply(
+                previous_hidden_state, params["wh"]
+            )
             if self.use_layer_norm:
-                pre = _layer_norm(pre)
-            h = act_fn(pre)
-            y = _linear_apply(h, params["wo"])
-            jac_diag = jac_fn(pre)
-            return h, (y, pre, h, jac_diag)
+                pre_activation = _layer_norm(pre_activation)
+            current_hidden_state = activation_function(pre_activation)
+            output_logits = _linear_apply(current_hidden_state, params["wo"])
+            jacobian_diagonal = jacobian_function(pre_activation)
+            return current_hidden_state, (
+                output_logits,
+                pre_activation,
+                current_hidden_state,
+                jacobian_diagonal,
+            )
 
-        _, (ys, pre_ts, h_ts, jac_diags) = jax.lax.scan(step, h0, x.swapaxes(0, 1))
-        output = ys.swapaxes(0, 1)
+        # Process sequence using scan: input is [T, B, D], output is [T, B, ...]
+        _, (outputs, pre_activations, hidden_states, jacobian_diagonals) = jax.lax.scan(
+            step, initial_hidden_state, input_sequence.swapaxes(0, 1)
+        )
+        # Swap back to [B, T, ...] format
+        output = outputs.swapaxes(0, 1)
         if not return_features:
             return output
         features = RNNRuntimeTensors(
-            pre_activations=pre_ts.swapaxes(0, 1),
-            hidden_states=h_ts.swapaxes(0, 1),
-            nonlinearity_jacobian_diag=jac_diags.swapaxes(0, 1),
+            pre_activations=pre_activations.swapaxes(0, 1),
+            hidden_states=hidden_states.swapaxes(0, 1),
+            nonlinearity_jacobian_diag=jacobian_diagonals.swapaxes(0, 1),
         )
         return output, features
 
@@ -163,37 +234,101 @@ class ElmanRNN(BaseSequenceModel):
         x: jnp.ndarray,
         mask: jnp.ndarray,
     ) -> Tuple[jnp.ndarray, RNNRuntimeTensors, JacobianFeatureSummary]:
-        outputs, tensors = self.apply(params, x, mask, return_features=True)
-        wh_weight = params["wh"]["w"]
-        stats = compute_jacobian_features(
-            tensors.nonlinearity_jacobian_diag, wh_weight, mask
+        """
+        Runs forward pass and computes Jacobian-based statistics for analysis.
+        These statistics help understand gradient flow and stability properties.
+        """
+        outputs, runtime_tensors = self.apply(params, x, mask, return_features=True)
+        hidden_to_hidden_weight = params["wh"]["w"]
+        jacobian_statistics = compute_jacobian_features(
+            runtime_tensors.nonlinearity_jacobian_diag, hidden_to_hidden_weight, mask
         )
-        return outputs, tensors, stats
+        return outputs, runtime_tensors, jacobian_statistics
 
 
 class LSTM(BaseSequenceModel):
+    """
+    Long Short-Term Memory (LSTM) network with input, forget, output gates.
+    Maintains both hidden state and cell state for better long-term memory.
+    """
+
     def __init__(self, config: ModelConfig):
+        """
+        Initializes LSTM with specified configuration.
+        """
         super().__init__(config)
         self.hidden_dim = config.hidden_dim
         self.param_dtype = _resolve_dtype(config.param_dtype or config.precision)
         self.use_layer_norm = config.use_layer_norm
 
     def initialize(self, key: jax.Array) -> Any:
-        H = self.hidden_dim
-        D = self.config.input_dim
-        keys = jax.random.split(key, 9)
+        """
+        Initializes LSTM parameters: 4 gates (input, forget, output, candidate) each with
+        input-to-hidden and hidden-to-hidden weights, plus output projection weights.
+        """
+        hidden_dim = self.hidden_dim
+        input_dim = self.config.input_dim
+        random_keys = jax.random.split(key, 9)
         return {
-            "wxi": _init_linear(keys[0], D, H, use_bias=True, dtype=self.param_dtype),
-            "whi": _init_linear(keys[1], H, H, use_bias=True, dtype=self.param_dtype),
-            "wxf": _init_linear(keys[2], D, H, use_bias=True, dtype=self.param_dtype),
-            "whf": _init_linear(keys[3], H, H, use_bias=True, dtype=self.param_dtype),
-            "wxo": _init_linear(keys[4], D, H, use_bias=True, dtype=self.param_dtype),
-            "who": _init_linear(keys[5], H, H, use_bias=True, dtype=self.param_dtype),
-            "wxc": _init_linear(keys[6], D, H, use_bias=True, dtype=self.param_dtype),
-            "whc": _init_linear(keys[7], H, H, use_bias=True, dtype=self.param_dtype),
+            "wxi": _init_linear(
+                random_keys[0],
+                input_dim,
+                hidden_dim,
+                use_bias=True,
+                dtype=self.param_dtype,
+            ),
+            "whi": _init_linear(
+                random_keys[1],
+                hidden_dim,
+                hidden_dim,
+                use_bias=True,
+                dtype=self.param_dtype,
+            ),
+            "wxf": _init_linear(
+                random_keys[2],
+                input_dim,
+                hidden_dim,
+                use_bias=True,
+                dtype=self.param_dtype,
+            ),
+            "whf": _init_linear(
+                random_keys[3],
+                hidden_dim,
+                hidden_dim,
+                use_bias=True,
+                dtype=self.param_dtype,
+            ),
+            "wxo": _init_linear(
+                random_keys[4],
+                input_dim,
+                hidden_dim,
+                use_bias=True,
+                dtype=self.param_dtype,
+            ),
+            "who": _init_linear(
+                random_keys[5],
+                hidden_dim,
+                hidden_dim,
+                use_bias=True,
+                dtype=self.param_dtype,
+            ),
+            "wxc": _init_linear(
+                random_keys[6],
+                input_dim,
+                hidden_dim,
+                use_bias=True,
+                dtype=self.param_dtype,
+            ),
+            "whc": _init_linear(
+                random_keys[7],
+                hidden_dim,
+                hidden_dim,
+                use_bias=True,
+                dtype=self.param_dtype,
+            ),
             "wo": _init_linear(
-                keys[8],
-                H,
+                random_keys[8],
+                hidden_dim,
                 self.config.output_dim,
                 use_bias=True,
                 dtype=self.param_dtype,
@@ -208,48 +343,88 @@ class LSTM(BaseSequenceModel):
         *,
         return_features: bool = False,
     ) -> Tuple[jnp.ndarray, LSTMRuntimeTensors] | jnp.ndarray:
-        B, _, _ = x.shape
-        H = self.hidden_dim
-        x = x.astype(self.param_dtype)
-        h0 = jnp.zeros((B, H), dtype=self.param_dtype)
-        c0 = jnp.zeros((B, H), dtype=self.param_dtype)
-        tanh = jnp.tanh
-
-        def step(carry, x_t):
-            h_prev, c_prev = carry
-            i = jax.nn.sigmoid(
-                _linear_apply(x_t, params["wxi"]) + _linear_apply(h_prev, params["whi"])
-            )
-            f = jax.nn.sigmoid(
-                _linear_apply(x_t, params["wxf"]) + _linear_apply(h_prev, params["whf"])
-            )
-            o = jax.nn.sigmoid(
-                _linear_apply(x_t, params["wxo"]) + _linear_apply(h_prev, params["who"])
-            )
-            pre_g = _linear_apply(x_t, params["wxc"]) + _linear_apply(
-                h_prev, params["whc"]
-            )
-            if self.use_layer_norm:
-                pre_g = _layer_norm(pre_g)
-            g = tanh(pre_g)
-            c = f * c_prev + i * g
-            h = o * tanh(c)
-            y = _linear_apply(h, params["wo"])
-            jac_diag = 1.0 - g**2
-            return (h, c), (y, pre_g, g, i, jac_diag, h)
-
-        _, (ys, pre_gs, g_states, i_gates, jac_diags, h_states) = jax.lax.scan(
-            step, (h0, c0), x.swapaxes(0, 1)
+        """
+        Forward pass through the LSTM.
+        Implements the standard LSTM cell with input, forget, output gates and candidate state.
+        """
+        batch_size, _, _ = x.shape
+        hidden_dim = self.hidden_dim
+        input_sequence = x.astype(self.param_dtype)
+        initial_hidden_state = jnp.zeros(
+            (batch_size, hidden_dim), dtype=self.param_dtype
         )
-        output = ys.swapaxes(0, 1)
+        initial_cell_state = jnp.zeros((batch_size, hidden_dim), dtype=self.param_dtype)
+        tanh_activation = jnp.tanh
+
+        def step(carry, current_input):
+            """
+            Single LSTM step: computes gates, updates cell state, and produces hidden state.
+            """
+            previous_hidden_state, previous_cell_state = carry
+            # Compute three gates: input, forget, and output
+            input_gate = jax.nn.sigmoid(
+                _linear_apply(current_input, params["wxi"])
+                + _linear_apply(previous_hidden_state, params["whi"])
+            )
+            forget_gate = jax.nn.sigmoid(
+                _linear_apply(current_input, params["wxf"])
+                + _linear_apply(previous_hidden_state, params["whf"])
+            )
+            output_gate = jax.nn.sigmoid(
+                _linear_apply(current_input, params["wxo"])
+                + _linear_apply(previous_hidden_state, params["who"])
+            )
+            # Compute candidate state (what to potentially add to cell state)
+            candidate_pre_activation = _linear_apply(
+                current_input, params["wxc"]
+            ) + _linear_apply(previous_hidden_state, params["whc"])
+            if self.use_layer_norm:
+                candidate_pre_activation = _layer_norm(candidate_pre_activation)
+            candidate_state = tanh_activation(candidate_pre_activation)
+            # Update cell state: forget old info, add new candidate
+            current_cell_state = (
+                forget_gate * previous_cell_state + input_gate * candidate_state
+            )
+            # Compute hidden state from cell state
+            current_hidden_state = output_gate * tanh_activation(current_cell_state)
+            output_logits = _linear_apply(current_hidden_state, params["wo"])
+            # Jacobian diagonal for candidate state (derivative of tanh)
+            jacobian_diagonal = 1.0 - candidate_state**2
+            return (current_hidden_state, current_cell_state), (
+                output_logits,
+                candidate_pre_activation,
+                candidate_state,
+                input_gate,
+                jacobian_diagonal,
+                current_hidden_state,
+            )
+
+        # Process sequence: input is [T, B, D], output is [T, B, ...]
+        (
+            _,
+            (
+                outputs,
+                candidate_pre_activations,
+                candidate_states,
+                input_gates,
+                jacobian_diagonals,
+                hidden_states,
+            ),
+        ) = jax.lax.scan(
+            step,
+            (initial_hidden_state, initial_cell_state),
+            input_sequence.swapaxes(0, 1),
+        )
+        # Swap back to [B, T, ...] format
+        output = outputs.swapaxes(0, 1)
         if not return_features:
             return output
         features = LSTMRuntimeTensors(
-            candidate_pre_activations=pre_gs.swapaxes(0, 1),
-            candidate_states=g_states.swapaxes(0, 1),
-            input_gates=i_gates.swapaxes(0, 1),
-            hidden_states=h_states.swapaxes(0, 1),
-            nonlinearity_jacobian_diag=jac_diags.swapaxes(0, 1),
+            candidate_pre_activations=candidate_pre_activations.swapaxes(0, 1),
+            candidate_states=candidate_states.swapaxes(0, 1),
+            input_gates=input_gates.swapaxes(0, 1),
+            hidden_states=hidden_states.swapaxes(0, 1),
+            nonlinearity_jacobian_diag=jacobian_diagonals.swapaxes(0, 1),
         )
         return output, features
 
@@ -259,22 +434,38 @@ class LSTM(BaseSequenceModel):
         x: jnp.ndarray,
         mask: jnp.ndarray,
     ) -> Tuple[jnp.ndarray, LSTMRuntimeTensors, JacobianFeatureSummary]:
-        outputs, tensors = self.apply(params, x, mask, return_features=True)
-        # Effective Jacobian uses candidate path: diag(i_t * (1 - g_t^2)) @ W_hc
-        # i_t has already scaled g_t in the cell update; include it explicitly
-        hidden_diag = tensors.nonlinearity_jacobian_diag * tensors.input_gates
-        wh_weight = params["whc"]["w"]
-        stats = compute_jacobian_features(hidden_diag, wh_weight, mask)
-        return outputs, tensors, stats
+        """
+        Runs forward pass and computes Jacobian-based statistics for analysis.
+        For LSTM, the effective Jacobian combines candidate state derivative with input gate.
+        """
+        outputs, runtime_tensors = self.apply(params, x, mask, return_features=True)
+        # Effective Jacobian uses candidate path: diag(input_gate * (1 - candidate_state^2)) @ W_hc
+        # The input gate has already scaled the candidate in the cell update; include it explicitly
+        hidden_jacobian_diagonal = (
+            runtime_tensors.nonlinearity_jacobian_diag * runtime_tensors.input_gates
+        )
+        hidden_to_hidden_weight = params["whc"]["w"]
+        jacobian_statistics = compute_jacobian_features(
+            hidden_jacobian_diagonal, hidden_to_hidden_weight, mask
+        )
+        return outputs, runtime_tensors, jacobian_statistics
 
 
 class UnitaryRNN(BaseSequenceModel):
+    """
+    RNN with orthogonal (unitary) hidden-to-hidden weight matrix.
+    The orthogonal constraint helps maintain gradient norm and improve training stability.
+    """
+
     def __init__(
         self,
         config: ModelConfig,
         nonlinearity: str = "tanh",
         nonlinearity_kwargs: Dict[str, Any] | None = None,
     ):
+        """
+        Initializes UnitaryRNN with specified configuration and activation function.
+        """
         super().__init__(config)
         self._nonlinearity: Nonlinearity = get_nonlinearity(
             nonlinearity, **(nonlinearity_kwargs or {})
@@ -282,30 +473,41 @@ class UnitaryRNN(BaseSequenceModel):
         self.param_dtype = _resolve_dtype(config.param_dtype or config.precision)
         self.use_layer_norm = config.use_layer_norm
 
-    def _orthogonal_matrix(self, raw: Array) -> Array:
-        base = raw.astype(jnp.float32)
-        q, r = jnp.linalg.qr(base)
-        diag = jnp.sign(jnp.diag(r))
-        diag = jnp.where(diag == 0.0, 1.0, diag)
-        return (q * diag).astype(self.param_dtype)
+    def _orthogonal_matrix(self, raw_weight_matrix: Array) -> Array:
+        """
+        Converts a raw weight matrix to an orthogonal matrix using QR decomposition.
+        Ensures the matrix has determinant +1 by adjusting signs of Q columns.
+        """
+        base_matrix = raw_weight_matrix.astype(jnp.float32)
+        orthogonal_matrix, upper_triangular_matrix = jnp.linalg.qr(base_matrix)
+        diagonal_signs = jnp.sign(jnp.diag(upper_triangular_matrix))
+        # Ensure no zero signs (replace with 1.0)
+        diagonal_signs = jnp.where(diagonal_signs == 0.0, 1.0, diagonal_signs)
+        return (orthogonal_matrix * diagonal_signs).astype(self.param_dtype)
 
     def initialize(self, key: jax.Array) -> Any:
-        k1, k2, k3, _ = jax.random.split(key, 4)
+        """
+        Initializes UnitaryRNN parameters: a raw hidden-to-hidden weight matrix
+        (which will be made orthogonal), plus input and output projection weights.
+        """
+        hidden_to_hidden_key, input_to_hidden_key, hidden_to_output_key, _ = (
+            jax.random.split(key, 4)
+        )
         return {
             "wh_raw": jax.random.normal(
-                k1,
+                hidden_to_hidden_key,
                 (self.config.hidden_dim, self.config.hidden_dim),
                 dtype=self.param_dtype,
             ),
             "wx": _init_linear(
-                k2,
+                input_to_hidden_key,
                 self.config.input_dim,
                 self.config.hidden_dim,
                 use_bias=True,
                 dtype=self.param_dtype,
             ),
             "wo": _init_linear(
-                k3,
+                hidden_to_output_key,
                 self.config.hidden_dim,
                 self.config.output_dim,
                 use_bias=True,
@@ -321,32 +523,54 @@ class UnitaryRNN(BaseSequenceModel):
         *,
         return_features: bool = False,
     ) -> Tuple[jnp.ndarray, RNNRuntimeTensors] | jnp.ndarray:
-        B, _, _ = x.shape
-        H = self.config.hidden_dim
-        x = x.astype(self.param_dtype)
-        h0 = jnp.zeros((B, H), dtype=self.param_dtype)
-        wh = self._orthogonal_matrix(params["wh_raw"])
-        act_fn = self._nonlinearity.fn
-        jac_fn = self._nonlinearity.jacobian_diag
+        """
+        Forward pass through the UnitaryRNN.
+        Uses an orthogonal hidden-to-hidden weight matrix to help with gradient stability.
+        """
+        batch_size, _, _ = x.shape
+        hidden_dim = self.config.hidden_dim
+        input_sequence = x.astype(self.param_dtype)
+        initial_hidden_state = jnp.zeros(
+            (batch_size, hidden_dim), dtype=self.param_dtype
+        )
+        # Convert raw weight matrix to orthogonal matrix
+        hidden_weight_matrix = self._orthogonal_matrix(params["wh_raw"])
+        activation_function = self._nonlinearity.fn
+        jacobian_function = self._nonlinearity.jacobian_diag
 
-        def step(carry, x_t):
-            h_prev = carry
-            pre = _linear_apply(x_t, params["wx"]) + (h_prev @ wh.T)
+        def step(carry, current_input):
+            """
+            Single UnitaryRNN step: combines input projection with orthogonal hidden transformation.
+            """
+            previous_hidden_state = carry
+            # Combine input projection and orthogonal hidden-to-hidden transformation
+            pre_activation = _linear_apply(current_input, params["wx"]) + (
+                previous_hidden_state @ hidden_weight_matrix.T
+            )
             if self.use_layer_norm:
-                pre = _layer_norm(pre)
-            h = act_fn(pre)
-            y = _linear_apply(h, params["wo"])
-            jac_diag = jac_fn(pre)
-            return h, (y, pre, h, jac_diag)
+                pre_activation = _layer_norm(pre_activation)
+            current_hidden_state = activation_function(pre_activation)
+            output_logits = _linear_apply(current_hidden_state, params["wo"])
+            jacobian_diagonal = jacobian_function(pre_activation)
+            return current_hidden_state, (
+                output_logits,
+                pre_activation,
+                current_hidden_state,
+                jacobian_diagonal,
+            )
 
-        _, (ys, pre_ts, h_ts, jac_diags) = jax.lax.scan(step, h0, x.swapaxes(0, 1))
-        output = ys.swapaxes(0, 1)
+        # Process sequence: input is [T, B, D], output is [T, B, ...]
+        _, (outputs, pre_activations, hidden_states, jacobian_diagonals) = jax.lax.scan(
+            step, initial_hidden_state, input_sequence.swapaxes(0, 1)
+        )
+        # Swap back to [B, T, ...] format
+        output = outputs.swapaxes(0, 1)
         if not return_features:
             return output
         features = RNNRuntimeTensors(
-            pre_activations=pre_ts.swapaxes(0, 1),
-            hidden_states=h_ts.swapaxes(0, 1),
-            nonlinearity_jacobian_diag=jac_diags.swapaxes(0, 1),
+            pre_activations=pre_activations.swapaxes(0, 1),
+            hidden_states=hidden_states.swapaxes(0, 1),
+            nonlinearity_jacobian_diag=jacobian_diagonals.swapaxes(0, 1),
         )
         return output, features
 
@@ -356,9 +580,13 @@ class UnitaryRNN(BaseSequenceModel):
         x: jnp.ndarray,
         mask: jnp.ndarray,
     ) -> Tuple[jnp.ndarray, RNNRuntimeTensors, JacobianFeatureSummary]:
-        outputs, tensors = self.apply(params, x, mask, return_features=True)
-        wh_weight = self._orthogonal_matrix(params["wh_raw"])
-        stats = compute_jacobian_features(
-            tensors.nonlinearity_jacobian_diag, wh_weight, mask
+        """
+        Runs forward pass and computes Jacobian-based statistics for analysis.
+        Uses the orthogonal hidden-to-hidden weight matrix for statistics computation.
+        """
+        outputs, runtime_tensors = self.apply(params, x, mask, return_features=True)
+        hidden_to_hidden_weight = self._orthogonal_matrix(params["wh_raw"])
+        jacobian_statistics = compute_jacobian_features(
+            runtime_tensors.nonlinearity_jacobian_diag, hidden_to_hidden_weight, mask
         )
-        return outputs, tensors, stats
+        return outputs, runtime_tensors, jacobian_statistics
