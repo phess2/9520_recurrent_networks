@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=hydra_copy_sweep
+#SBATCH --job-name=hydra_kbit_sweep
 #SBATCH --partition=mit_normal_gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -14,4 +14,4 @@ source /orcd/software/core/001/pkg/miniforge/24.3.0-0/etc/profile.d/conda.sh
 conda activate /home/ostrow/.conda/envs/recurrent-networks
 cd /orcd/data/fiete/001/om2/ostrow/SLT/9520_recurrent_networks
 
-python -m src.train.train_copy --config-name copy -m train.seed=0,1,2 model=lstm,elman,unitary,lru model.hidden_dim=32,64,128 optimizer.lr=1e-2,1e-3,5e-4
+python -m src.train.train_kbit --config-name kbit_flipflop -m train.seed=0,1,2 model=lstm,elman,unitary,lru model.hidden_dim=32,64,128 optimizer.lr=1e-2,1e-3,5e-4

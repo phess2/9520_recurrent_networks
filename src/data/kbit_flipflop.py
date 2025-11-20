@@ -32,8 +32,10 @@ class KBitFlipFlopDataset:
         Returns:
             inputs: [batch_size, seq_length, k]   # input pulses + noise
             targets: [batch_size, seq_length, k]  # last seen pulse for each bit, held constant until next
+            mask: [batch_size, seq_length]        # all ones (full sequence is valid)
         """
         key, subkey = jax.random.split(self.key)
+        self.key = key
         # Step 1: Sample pulse occurrence for all positions [batch, seq_len, k]
         pulse_key, sign_key, noise_key = jax.random.split(subkey, 3)
         # Bernoulli for pulse presence
@@ -72,4 +74,5 @@ class KBitFlipFlopDataset:
         )(pulses)
 
         # targets shape: [batch, seq_len, k]
-        return inputs, targets
+        mask = jnp.ones((self.batch_size, self.seq_length), dtype=jnp.float32)
+        return inputs, targets, mask
