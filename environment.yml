@@ -40,6 +40,8 @@ dependencies:
       - dataclasses-json
       - numpyro
       - distrax
+      - hydra-core
+      - hydra-submitit-launcher
 
 # Notes:
 # - Do NOT install cudatoolkit via conda when using JAX CUDA pip wheels; it can conflict.
