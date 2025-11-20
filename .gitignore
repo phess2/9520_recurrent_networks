@@ -216,6 +216,7 @@ checkpoints/
 # hydra
 outputs/
 multirun/
+*.out
 
 # slurm logs
 outLogs/
