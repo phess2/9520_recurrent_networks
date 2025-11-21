@@ -1,5 +1,5 @@
 architecture: elman
-hidden_dim: 256
+hidden_dim: 512
 num_layers: 1
 precision: ${train.precision}
 param_dtype: ${train.precision}

@@ -119,3 +119,31 @@ class LinearRecurrentUnit(BaseSequenceModel):
     def receptive_field(self) -> int:
         # Linear recurrence has full temporal dependency
         return 10_000_000  # proxy for "unbounded" in finite computation
+
+    def compute_parameter_count(self) -> int:
+        """
+        Computes the total number of parameters based on the model configuration.
+        Returns the expected parameter count without requiring initialized parameters.
+        
+        Parameters:
+        - A: state_dim × state_dim
+        - B: state_dim × input_dim
+        - mlp_w1: state_dim × mlp_hidden_dim
+        - mlp_b1: mlp_hidden_dim
+        - mlp_w2: mlp_hidden_dim × output_dim
+        - mlp_b2: output_dim
+        """
+        state_dim = self.state_dim
+        input_dim = self.config.input_dim
+        output_dim = self.config.output_dim
+        mlp_hidden_dim = self.mlp_hidden_dim
+        
+        count = (
+            state_dim * state_dim +  # A
+            state_dim * input_dim +  # B
+            state_dim * mlp_hidden_dim +  # mlp_w1
+            mlp_hidden_dim +  # mlp_b1
+            mlp_hidden_dim * output_dim +  # mlp_w2
+            output_dim  # mlp_b2
+        )
+        return int(count)

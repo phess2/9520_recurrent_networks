@@ -245,6 +245,27 @@ class ElmanRNN(BaseSequenceModel):
         )
         return outputs, runtime_tensors, jacobian_statistics
 
+    def compute_parameter_count(self) -> int:
+        """
+        Computes the total number of parameters based on the model configuration.
+        Returns the expected parameter count without requiring initialized parameters.
+        
+        Parameters:
+        - wx: input_dim × hidden_dim + hidden_dim (bias)
+        - wh: hidden_dim × hidden_dim + hidden_dim (bias)
+        - wo: hidden_dim × output_dim + output_dim (bias)
+        """
+        input_dim = self.config.input_dim
+        hidden_dim = self.config.hidden_dim
+        output_dim = self.config.output_dim
+        
+        count = (
+            input_dim * hidden_dim + hidden_dim +  # wx + bias
+            hidden_dim * hidden_dim + hidden_dim +  # wh + bias
+            hidden_dim * output_dim + output_dim  # wo + bias
+        )
+        return int(count)
+
 
 class LSTM(BaseSequenceModel):
     """
@@ -450,6 +471,32 @@ class LSTM(BaseSequenceModel):
         )
         return outputs, runtime_tensors, jacobian_statistics
 
+    def compute_parameter_count(self) -> int:
+        """
+        Computes the total number of parameters based on the model configuration.
+        Returns the expected parameter count without requiring initialized parameters.
+        
+        Parameters:
+        - 4 gates (input, forget, output, candidate), each with:
+          - Input-to-hidden: input_dim × hidden_dim + hidden_dim (bias)
+          - Hidden-to-hidden: hidden_dim × hidden_dim + hidden_dim (bias)
+        - wo: hidden_dim × output_dim + output_dim (bias)
+        """
+        input_dim = self.config.input_dim
+        hidden_dim = self.hidden_dim
+        output_dim = self.config.output_dim
+        
+        # Each of the 4 gates has input-to-hidden and hidden-to-hidden weights + biases
+        gate_params = 4 * (
+            (input_dim * hidden_dim + hidden_dim) +  # input-to-hidden + bias
+            (hidden_dim * hidden_dim + hidden_dim)  # hidden-to-hidden + bias
+        )
+        # Output projection
+        output_params = hidden_dim * output_dim + output_dim
+        
+        count = gate_params + output_params
+        return int(count)
+
 
 class UnitaryRNN(BaseSequenceModel):
     """
@@ -590,3 +637,24 @@ class UnitaryRNN(BaseSequenceModel):
             runtime_tensors.nonlinearity_jacobian_diag, hidden_to_hidden_weight, mask
         )
         return outputs, runtime_tensors, jacobian_statistics
+
+    def compute_parameter_count(self) -> int:
+        """
+        Computes the total number of parameters based on the model configuration.
+        Returns the expected parameter count without requiring initialized parameters.
+        
+        Parameters:
+        - wh_raw: hidden_dim × hidden_dim (raw weight matrix, made orthogonal during forward pass)
+        - wx: input_dim × hidden_dim + hidden_dim (bias)
+        - wo: hidden_dim × output_dim + output_dim (bias)
+        """
+        input_dim = self.config.input_dim
+        hidden_dim = self.config.hidden_dim
+        output_dim = self.config.output_dim
+        
+        count = (
+            hidden_dim * hidden_dim +  # wh_raw
+            input_dim * hidden_dim + hidden_dim +  # wx + bias
+            hidden_dim * output_dim + output_dim  # wo + bias
+        )
+        return int(count)

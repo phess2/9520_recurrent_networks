@@ -163,6 +163,14 @@ def train_copy(
     model_params = model.initialize(random_key)
     optimizer_state = optimizer.init(model_params)
 
+    # Print model information including parameter count
+    param_count = model.parameter_count(model_params)
+    param_count_millions = param_count / 1_000_000
+    model_name = model.__class__.__name__
+    print(f"\nModel: {model_name}")
+    print(f"Total parameters: {param_count_millions:.1f}M ({param_count:,})")
+    print("-" * 80)
+
     # Configure feature logging (for models that support analyze_batch)
     supports_feature_logging = hasattr(model, "analyze_batch")
     feature_log_every = int(getattr(train_cfg, "feature_log_every", 0) or 0)

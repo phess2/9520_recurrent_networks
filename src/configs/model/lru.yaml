@@ -1,5 +1,5 @@
 architecture: lru
-hidden_dim: 128
+hidden_dim: 384
 num_layers: 1
 precision: ${train.precision}
 param_dtype: ${train.precision}
