@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import math
 import os
 import re
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Dict, Any
 import time
 
@@ -18,6 +19,7 @@ from ..configs.schemas import OptimizerConfig, TrainLoopConfig
 from ..data.dgm_dataset import DGMDataset, DGMConfig
 from ..models.base import BaseSequenceModel, ModelConfig
 from .model_factory import build_model
+from .train_base import save_weight_checkpoint
 import orbax.checkpoint as ocp
 
 from ..utils.metrics import mutual_information_placeholder
@@ -133,6 +135,27 @@ def train(
     )
 
     dataset = DGMDataset(data_cfg)
+    length_generalization_fractions = tuple(
+        float(value)
+        for value in (train_cfg.length_generalization_fractions or ())
+        if value is not None
+    )
+    length_generalization_datasets: Dict[float, DGMDataset] = {}
+    for factor in length_generalization_fractions:
+        if factor <= 1.0:
+            continue
+        longer_cfg = replace(
+            data_cfg,
+            mean_seq_len=int(math.ceil(data_cfg.mean_seq_len * factor)),
+            std_seq_len=int(math.ceil(data_cfg.std_seq_len * factor)),
+        )
+        length_generalization_datasets[factor] = DGMDataset(longer_cfg)
+    noise_generalization_stddevs = tuple(
+        float(value)
+        for value in (train_cfg.noise_generalization_stddevs or ())
+        if value is not None
+    )
+    generalization_rng = jax.random.PRNGKey(train_cfg.seed + 4)
     opt = build_optimizer(optimizer_cfg, train_cfg.steps)
 
     key = jax.random.PRNGKey(train_cfg.seed)
@@ -146,6 +169,9 @@ def train(
         os.makedirs(feature_save_dir, exist_ok=True)
     last_feature_metrics: Dict[str, float] | None = None
     last_eval_metrics: Dict[str, float] | None = None
+    last_generalization_metrics: Dict[str, float] | None = None
+    dataset_name = "dgm"
+    architecture_name = re.sub(r"(?<!^)(?=[A-Z])", "_", model.__class__.__name__).lower()
     start_time = time.time()
 
     ckpt_mgr = None
@@ -205,6 +231,70 @@ def train(
         logits = model.apply(p, maybe_cast_precision(obs, train_cfg.precision), mask)
         metrics = compute_metrics(logits, target_ids, mask_t, discrete=True)
         return metrics
+
+    def evaluate_with_noise_batch(
+        params_to_eval,
+        batch: Dict[str, jnp.ndarray],
+        noise_std: float = 0.0,
+        rng_key: jax.Array | None = None,
+    ) -> Dict[str, jnp.ndarray]:
+        observations = batch["observations"]
+        mask = batch["mask"]
+        processed_obs = maybe_cast_precision(observations, train_cfg.precision)
+        if noise_std and noise_std > 0.0:
+            if rng_key is None:
+                rng_key = jax.random.PRNGKey(0)
+            noise = noise_std * jax.random.normal(
+                rng_key, processed_obs.shape, dtype=processed_obs.dtype
+            )
+            processed_obs = processed_obs + noise
+        if data_cfg.discrete_latent:
+            target_ids, mask_t = shift_targets_ids(batch["obs_ids"], mask)
+            logits = model.apply(params_to_eval, processed_obs, mask)
+            return compute_metrics(logits, target_ids, mask_t, discrete=True)
+        target_vals, mask_t = shift_targets(observations, mask)
+        predictions = model.apply(params_to_eval, processed_obs, mask)
+        return compute_metrics(predictions, target_vals, mask_t, discrete=False)
+
+    def run_length_generalization(step_idx: int, params_for_eval) -> Dict[str, float]:
+        logged_metrics: Dict[str, float] = {}
+        if not length_generalization_datasets:
+            return logged_metrics
+        for factor, gen_dataset in length_generalization_datasets.items():
+            batch = gen_dataset.sample_batch()
+            metrics = evaluate_with_noise_batch(params_for_eval, batch, 0.0)
+            log_prefix = f"features/generalization/length_x{factor:.2f}"
+            payload = {
+                "step": step_idx,
+                f"{log_prefix}/nll": float(metrics["nll"]),
+                f"{log_prefix}/accuracy": float(metrics["accuracy"]),
+            }
+            wandb.log(payload)
+            logged_metrics.update({k: v for k, v in payload.items() if k != "step"})
+        return logged_metrics
+
+    def run_noise_generalization(step_idx: int, params_for_eval) -> Dict[str, float]:
+        logged_metrics: Dict[str, float] = {}
+        if not noise_generalization_stddevs:
+            return logged_metrics
+        nonlocal generalization_rng
+        for std in noise_generalization_stddevs:
+            if std is None or std < 0.0:
+                continue
+            generalization_rng, noise_key = jax.random.split(generalization_rng)
+            batch = dataset.sample_batch()
+            metrics = evaluate_with_noise_batch(
+                params_for_eval, batch, float(std), noise_key
+            )
+            log_prefix = f"features/generalization/noise_{float(std):.3f}"
+            payload = {
+                "step": step_idx,
+                f"{log_prefix}/nll": float(metrics["nll"]),
+                f"{log_prefix}/accuracy": float(metrics["accuracy"]),
+            }
+            wandb.log(payload)
+            logged_metrics.update({k: v for k, v in payload.items() if k != "step"})
+        return logged_metrics
 
     best_metric = None
     best_is_higher = train_cfg.ckpt_metric.lower() == "accuracy"
@@ -341,6 +431,14 @@ def train(
                         for name, value in last_feature_metrics.items()
                     )
                 )
+            if last_generalization_metrics:
+                print(
+                    "  gen  ┆ "
+                    + " │ ".join(
+                        f"{name}: {value:.4f}"
+                        for name, value in last_generalization_metrics.items()
+                    )
+                )
             print("-" * 80)
         else:
             maybe_log_features(step_idx, params, batch)
@@ -366,7 +464,22 @@ def train(
             )
             metrics_for_ckpt = {train_cfg.ckpt_metric: agg[train_cfg.ckpt_metric]}
             maybe_save_best(step_idx, metrics_for_ckpt, params, opt_state)
+            save_weight_checkpoint(
+                model,
+                params,
+                train_cfg,
+                dataset_name,
+                architecture_name,
+                step_idx,
+            )
             last_eval_metrics = {k: float(v) for k, v in agg.items()}
+            generalization_metrics: Dict[str, float] = {}
+            generalization_metrics.update(
+                run_length_generalization(step_idx, params)
+            )
+            generalization_metrics.update(run_noise_generalization(step_idx, params))
+            if generalization_metrics:
+                last_generalization_metrics = generalization_metrics
 
         if step_idx % train_cfg.ckpt_every == 0 and ckpt_mgr is not None:
             ckpt_mgr.save(step_idx, args={"params": params, "opt_state": opt_state})

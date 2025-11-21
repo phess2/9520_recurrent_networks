@@ -32,6 +32,7 @@ from .train_base import (
     format_hms,
     initialize_wandb_run,
     maybe_cast_precision,
+    save_weight_checkpoint,
     validate_precisions,
 )
 
@@ -68,6 +69,19 @@ def train_kbit(
         p=float(task_cfg.get("p", 0.01)),
         noise_std=float(task_cfg.get("noise_std", 0.01)),
     )
+    full_length_dataset = KBitFlipFlopDataset(
+        k=int(task_cfg["k"]),
+        batch_size=int(task_cfg["batch_size"]),
+        seq_length=int(task_cfg["seq_length"]),
+        p=float(task_cfg.get("p", 0.01)),
+        noise_std=float(task_cfg.get("noise_std", 0.01)),
+    )
+    noise_generalization_stddevs = tuple(
+        float(value)
+        for value in (train_cfg.noise_generalization_stddevs or ())
+        if value is not None
+    )
+    generalization_rng = jax.random.PRNGKey(train_cfg.seed + 3)
 
     input_dim = output_dim = int(task_cfg["k"])
     task_dims = {"input_dim": input_dim, "output_dim": output_dim}
@@ -87,6 +101,7 @@ def train_kbit(
         os.makedirs(feature_save_dir, exist_ok=True)
     last_feature_metrics: Dict[str, float] | None = None
     last_eval_metrics: Dict[str, float] | None = None
+    last_generalization_metrics: Dict[str, float] | None = None
     start_time = time.time()
 
     dataset_name = "kbit_flipflop"
@@ -103,6 +118,62 @@ def train_kbit(
 
     def cast_inputs(arr: jnp.ndarray) -> jnp.ndarray:
         return maybe_cast_precision(arr, train_cfg.precision)
+
+    def evaluate_with_noise(
+        params_to_eval,
+        inputs: jnp.ndarray,
+        targets: jnp.ndarray,
+        mask: jnp.ndarray,
+        noise_std: float = 0.0,
+        rng_key: jax.Array | None = None,
+    ) -> Dict[str, jnp.ndarray]:
+        processed_inputs = cast_inputs(inputs)
+        if noise_std and noise_std > 0.0:
+            if rng_key is None:
+                rng_key = jax.random.PRNGKey(0)
+            noise = noise_std * jax.random.normal(
+                rng_key, processed_inputs.shape, dtype=processed_inputs.dtype
+            )
+            processed_inputs = processed_inputs + noise
+        predictions = model.apply(params_to_eval, processed_inputs, mask)
+        return compute_regression_metrics(predictions, targets, mask)
+
+    def run_length_generalization(step_index: int, params_for_eval) -> Dict[str, float]:
+        logged_metrics: Dict[str, float] = {}
+        inputs, targets, mask = full_length_dataset()
+        metrics = evaluate_with_noise(params_for_eval, inputs, targets, mask, 0.0)
+        log_prefix = "features/generalization/full_length"
+        payload = {
+            "step": step_index,
+            f"{log_prefix}/mse": float(metrics["mse"]),
+            f"{log_prefix}/mae": float(metrics["mae"]),
+        }
+        wandb.log(payload)
+        logged_metrics.update({k: v for k, v in payload.items() if k != "step"})
+        return logged_metrics
+
+    def run_noise_generalization(step_index: int, params_for_eval) -> Dict[str, float]:
+        logged_metrics: Dict[str, float] = {}
+        if not noise_generalization_stddevs:
+            return logged_metrics
+        nonlocal generalization_rng
+        for std in noise_generalization_stddevs:
+            if std is None or std < 0.0:
+                continue
+            generalization_rng, noise_key = jax.random.split(generalization_rng)
+            inputs, targets, mask = dataset()
+            metrics = evaluate_with_noise(
+                params_for_eval, inputs, targets, mask, float(std), noise_key
+            )
+            log_prefix = f"features/generalization/noise_{float(std):.3f}"
+            payload = {
+                "step": step_index,
+                f"{log_prefix}/mse": float(metrics["mse"]),
+                f"{log_prefix}/mae": float(metrics["mae"]),
+            }
+            wandb.log(payload)
+            logged_metrics.update({k: v for k, v in payload.items() if k != "step"})
+        return logged_metrics
 
     @jax.jit
     def train_step(model_params, optimizer_state, inputs, targets, mask):
@@ -485,6 +556,14 @@ def train_kbit(
                         for name, value in last_feature_metrics.items()
                     )
                 )
+            if last_generalization_metrics:
+                print(
+                    "  gen  ┆ "
+                    + " │ ".join(
+                        f"{name}: {value:.4f}"
+                        for name, value in last_generalization_metrics.items()
+                    )
+                )
             print("-" * 80)
         else:
             maybe_log_features(step_index, model_params, input_sequence, attention_mask)
@@ -519,11 +598,28 @@ def train_kbit(
             maybe_save_best(
                 step_index, metrics_for_checkpoint, model_params, optimizer_state
             )
+            save_weight_checkpoint(
+                model,
+                model_params,
+                train_cfg,
+                dataset_name,
+                architecture_name,
+                step_index,
+            )
             last_eval_metrics = {
                 "eval/mse": aggregated_eval_metrics["mse"],
                 "eval/mae": aggregated_eval_metrics["mae"],
                 "eval/nll": aggregated_eval_metrics["nll"],
             }
+            generalization_metrics: Dict[str, float] = {}
+            generalization_metrics.update(
+                run_length_generalization(step_index, model_params)
+            )
+            generalization_metrics.update(
+                run_noise_generalization(step_index, model_params)
+            )
+            if generalization_metrics:
+                last_generalization_metrics = generalization_metrics
             if jacobian_batch is not None:
                 log_jacobian_figure(step_index, model_params, *jacobian_batch)
 

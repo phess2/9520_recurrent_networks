@@ -32,6 +32,7 @@ from .train_base import (
     format_hms,
     initialize_wandb_run,
     maybe_cast_precision,
+    save_weight_checkpoint,
     validate_precisions,
 )
 
@@ -76,6 +77,23 @@ def train_dyck(
         max_depth=int(task_cfg.get("max_depth", -1)),
         seed=train_cfg.seed,
     )
+    full_length_dataset = DyckDataset(
+        batch_size=int(task_cfg["batch_size"]),
+        num_pairs=int(task_cfg["num_pairs"]),
+        lower_window=int(task_cfg["upper_window"]),
+        upper_window=int(task_cfg["upper_window"]),
+        p_val=float(task_cfg["p_val"]),
+        q_val=float(task_cfg["q_val"]),
+        min_depth=int(task_cfg.get("min_depth", 0)),
+        max_depth=int(task_cfg.get("max_depth", -1)),
+        seed=train_cfg.seed + 1,
+    )
+    noise_generalization_stddevs = tuple(
+        float(value)
+        for value in (train_cfg.noise_generalization_stddevs or ())
+        if value is not None
+    )
+    generalization_rng = jax.random.PRNGKey(train_cfg.seed + 2)
 
     vocab_size = 2 * int(task_cfg["num_pairs"])
     input_dim = vocab_size + 1  # include pad token
@@ -98,6 +116,7 @@ def train_dyck(
         os.makedirs(feature_save_dir, exist_ok=True)
     last_feature_metrics: Dict[str, float] | None = None
     last_eval_metrics: Dict[str, float] | None = None
+    last_generalization_metrics: Dict[str, float] | None = None
     start_time = time.time()
 
     dataset_name = "dyck"
@@ -115,6 +134,25 @@ def train_dyck(
     def embed_inputs(token_ids: jnp.ndarray) -> jnp.ndarray:
         embedded = jax.nn.one_hot(token_ids, input_dim, dtype=jnp.float32)
         return maybe_cast_precision(embedded, train_cfg.precision)
+
+    def evaluate_with_noise(
+        params_to_eval,
+        inputs: jnp.ndarray,
+        targets: jnp.ndarray,
+        mask: jnp.ndarray,
+        noise_std: float = 0.0,
+        rng_key: jax.Array | None = None,
+    ) -> Dict[str, jnp.ndarray]:
+        embedded_inputs = embed_inputs(inputs)
+        if noise_std and noise_std > 0.0:
+            if rng_key is None:
+                rng_key = jax.random.PRNGKey(0)
+            noise = noise_std * jax.random.normal(
+                rng_key, embedded_inputs.shape, dtype=embedded_inputs.dtype
+            )
+            embedded_inputs = embedded_inputs + noise
+        logits = model.apply(params_to_eval, embedded_inputs, mask)
+        return compute_multi_label_metrics(logits, targets, mask)
 
     @jax.jit
     def train_step(
@@ -145,6 +183,43 @@ def train_dyck(
         logits = model.apply(model_params, embedded_inputs, mask)
         metrics = compute_multi_label_metrics(logits, targets, mask)
         return metrics
+
+    def run_length_generalization(step_index: int, params_for_eval) -> Dict[str, float]:
+        logged_metrics: Dict[str, float] = {}
+        inputs, targets, mask = full_length_dataset()
+        metrics = evaluate_with_noise(params_for_eval, inputs, targets, mask, 0.0)
+        log_prefix = "features/generalization/full_length"
+        payload = {
+            "step": step_index,
+            f"{log_prefix}/nll": float(metrics["nll"]),
+            f"{log_prefix}/accuracy": float(metrics["accuracy"]),
+        }
+        wandb.log(payload)
+        logged_metrics.update({k: v for k, v in payload.items() if k != "step"})
+        return logged_metrics
+
+    def run_noise_generalization(step_index: int, params_for_eval) -> Dict[str, float]:
+        logged_metrics: Dict[str, float] = {}
+        if not noise_generalization_stddevs:
+            return logged_metrics
+        nonlocal generalization_rng
+        for std in noise_generalization_stddevs:
+            if std is None or std < 0.0:
+                continue
+            generalization_rng, noise_key = jax.random.split(generalization_rng)
+            inputs, targets, mask = dataset()
+            metrics = evaluate_with_noise(
+                params_for_eval, inputs, targets, mask, float(std), noise_key
+            )
+            log_prefix = f"features/generalization/noise_{float(std):.3f}"
+            payload = {
+                "step": step_index,
+                f"{log_prefix}/nll": float(metrics["nll"]),
+                f"{log_prefix}/accuracy": float(metrics["accuracy"]),
+            }
+            wandb.log(payload)
+            logged_metrics.update({k: v for k, v in payload.items() if k != "step"})
+        return logged_metrics
 
     best_metric_value = None
     higher_is_better = train_cfg.ckpt_metric.lower() == "accuracy"
@@ -516,6 +591,14 @@ def train_dyck(
                         for name, value in last_feature_metrics.items()
                     )
                 )
+            if last_generalization_metrics:
+                print(
+                    "  gen  ┆ "
+                    + " │ ".join(
+                        f"{name}: {value:.4f}"
+                        for name, value in last_generalization_metrics.items()
+                    )
+                )
             print("-" * 80)
         else:
             maybe_log_features(step_index, model_params, input_ids, attention_mask)
@@ -549,10 +632,27 @@ def train_dyck(
             maybe_save_best(
                 step_index, metrics_for_checkpoint, model_params, optimizer_state
             )
+            save_weight_checkpoint(
+                model,
+                model_params,
+                train_cfg,
+                dataset_name,
+                architecture_name,
+                step_index,
+            )
             last_eval_metrics = {
                 "eval/nll": aggregated_eval_metrics["nll"],
                 "eval/accuracy": aggregated_eval_metrics["accuracy"],
             }
+            generalization_metrics: Dict[str, float] = {}
+            generalization_metrics.update(
+                run_length_generalization(step_index, model_params)
+            )
+            generalization_metrics.update(
+                run_noise_generalization(step_index, model_params)
+            )
+            if generalization_metrics:
+                last_generalization_metrics = generalization_metrics
             if jacobian_batch is not None:
                 log_jacobian_figure(step_index, model_params, *jacobian_batch)
 
