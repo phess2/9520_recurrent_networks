@@ -5,6 +5,7 @@ import os
 import re
 import time
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import jax.numpy as jnp
@@ -14,7 +15,7 @@ import wandb
 from omegaconf import DictConfig, OmegaConf
 
 from ..configs.schemas import OptimizerConfig, TrainLoopConfig
-from ..models.base import ModelConfig
+from ..models.base import BaseSequenceModel, ModelConfig
 
 
 class OrbaxWarningFilter(logging.Filter):
@@ -139,6 +140,28 @@ def create_checkpoint_manager(
         os.path.join("checkpoints", dataset_name, architecture_name)
     )
     return ocp.CheckpointManager(checkpoint_directory, ocp.PyTreeCheckpointer())
+
+
+def save_weight_checkpoint(
+    model: BaseSequenceModel,
+    params: Any,
+    train_cfg: TrainLoopConfig,
+    dataset_name: str,
+    architecture_name: str,
+    step_index: int,
+) -> Optional[str]:
+    """Persist model weights using the lightweight serialization hook."""
+    target_dir = getattr(train_cfg, "weight_checkpoint_dir", "weight_checkpoints")
+    if not target_dir:
+        return None
+    checkpoint_dir = (
+        Path(target_dir).expanduser().resolve() / dataset_name / architecture_name
+    )
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = checkpoint_dir / f"step_{step_index:06d}.pkl"
+    saved_path = model.save_weights(params, checkpoint_path)
+    logging.info("Saved weight checkpoint to %s", saved_path)
+    return saved_path
 
 
 def ensure_prediction_artifacts(

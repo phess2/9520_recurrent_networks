@@ -18,6 +18,7 @@ from ..configs.schemas import OptimizerConfig, TrainLoopConfig
 from ..data.dgm_dataset import DGMDataset, DGMConfig
 from ..models.base import BaseSequenceModel, ModelConfig
 from .model_factory import build_model
+from .train_base import save_weight_checkpoint
 import orbax.checkpoint as ocp
 
 from ..utils.metrics import mutual_information_placeholder
@@ -146,6 +147,8 @@ def train(
         os.makedirs(feature_save_dir, exist_ok=True)
     last_feature_metrics: Dict[str, float] | None = None
     last_eval_metrics: Dict[str, float] | None = None
+    dataset_name = "dgm"
+    architecture_name = re.sub(r"(?<!^)(?=[A-Z])", "_", model.__class__.__name__).lower()
     start_time = time.time()
 
     ckpt_mgr = None
@@ -366,6 +369,14 @@ def train(
             )
             metrics_for_ckpt = {train_cfg.ckpt_metric: agg[train_cfg.ckpt_metric]}
             maybe_save_best(step_idx, metrics_for_ckpt, params, opt_state)
+            save_weight_checkpoint(
+                model,
+                params,
+                train_cfg,
+                dataset_name,
+                architecture_name,
+                step_idx,
+            )
             last_eval_metrics = {k: float(v) for k, v in agg.items()}
 
         if step_idx % train_cfg.ckpt_every == 0 and ckpt_mgr is not None:

@@ -32,6 +32,7 @@ from .train_base import (
     format_hms,
     initialize_wandb_run,
     maybe_cast_precision,
+    save_weight_checkpoint,
     validate_precisions,
 )
 
@@ -518,6 +519,14 @@ def train_kbit(
             }
             maybe_save_best(
                 step_index, metrics_for_checkpoint, model_params, optimizer_state
+            )
+            save_weight_checkpoint(
+                model,
+                model_params,
+                train_cfg,
+                dataset_name,
+                architecture_name,
+                step_index,
             )
             last_eval_metrics = {
                 "eval/mse": aggregated_eval_metrics["mse"],

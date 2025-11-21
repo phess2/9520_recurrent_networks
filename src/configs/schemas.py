@@ -38,6 +38,7 @@ class TrainLoopConfig:
     feature_save_dir: str | None = None
     disable_checkpointing: bool = False
     sweep_run: bool = False
+    weight_checkpoint_dir: str = "weight_checkpoints"
 
 
 @dataclass
