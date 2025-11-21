@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -112,13 +113,27 @@ def train_copy(
         train_cfg, task_cfg, model_cfg, optimizer_cfg
     )
     # Create dataset generator for the copy task
+    base_min_lag = int(task_cfg["min_lag"])
+    base_max_lag = int(task_cfg["max_lag"])
+    seq_length = int(task_cfg.get("seq_length", 10))
     dataset = CopyDataset(
-        min_lag=int(task_cfg["min_lag"]),
-        max_lag=int(task_cfg["max_lag"]),
+        min_lag=base_min_lag,
+        max_lag=base_max_lag,
         batch_size=int(task_cfg["batch_size"]),
         num_classes=int(task_cfg["num_classes"]),
-        seq_length=int(task_cfg.get("seq_length", 10)),
+        seq_length=seq_length,
     )
+    length_generalization_fractions = tuple(
+        float(value)
+        for value in (train_cfg.length_generalization_fractions or ())
+        if value is not None
+    )
+    noise_generalization_stddevs = tuple(
+        float(value)
+        for value in (train_cfg.noise_generalization_stddevs or ())
+        if value is not None
+    )
+    generalization_rng = jax.random.PRNGKey(train_cfg.seed + 1)
 
     vocab_size = int(task_cfg["num_classes"])
     num_classes = vocab_size
@@ -144,6 +159,7 @@ def train_copy(
         os.makedirs(feature_save_dir, exist_ok=True)
     last_feature_metrics: Dict[str, float] | None = None
     last_eval_metrics: Dict[str, float] | None = None
+    last_generalization_metrics: Dict[str, float] | None = None
     start_time = time.time()
 
     dataset_name = "copy"
@@ -161,6 +177,26 @@ def train_copy(
     def embed_inputs(token_ids: jnp.ndarray) -> jnp.ndarray:
         embedded = jax.nn.one_hot(token_ids, input_dim, dtype=jnp.float32)
         return maybe_cast_precision(embedded, train_cfg.precision)
+
+    def evaluate_with_noise(
+        params_to_eval,
+        inputs: jnp.ndarray,
+        targets: jnp.ndarray,
+        mask: jnp.ndarray,
+        noise_std: float = 0.0,
+        rng_key: jax.Array | None = None,
+    ) -> Dict[str, jnp.ndarray]:
+        shifted_target_ids, shifted_target_mask = shift_targets(targets, mask)
+        embedded_inputs = embed_inputs(inputs)
+        if noise_std and noise_std > 0.0:
+            if rng_key is None:
+                rng_key = jax.random.PRNGKey(0)
+            noise = noise_std * jax.random.normal(
+                rng_key, embedded_inputs.shape, dtype=embedded_inputs.dtype
+            )
+            embedded_inputs = embedded_inputs + noise
+        logits = model.apply(params_to_eval, embedded_inputs, mask)
+        return compute_metrics(logits, shifted_target_ids, shifted_target_mask)
 
     @jax.jit
     def train_step(model_params, optimizer_state, inputs, targets, mask):
@@ -216,6 +252,57 @@ def train_copy(
         metrics = compute_metrics(logits, shifted_target_ids, shifted_target_mask)
 
         return metrics
+
+    def run_length_generalization(step_index: int, params_for_eval) -> Dict[str, float]:
+        logged_metrics: Dict[str, float] = {}
+        if not length_generalization_fractions:
+            return logged_metrics
+        for factor in length_generalization_fractions:
+            if factor is None or factor <= 1.0:
+                continue
+            extended_min = max(1, int(math.ceil(base_min_lag * factor)))
+            extended_max = max(extended_min, int(math.ceil(base_max_lag * factor)))
+            extended_dataset = CopyDataset(
+                min_lag=extended_min,
+                max_lag=extended_max,
+                batch_size=int(task_cfg["batch_size"]),
+                num_classes=int(task_cfg["num_classes"]),
+                seq_length=seq_length,
+            )
+            inputs, targets, mask = extended_dataset()
+            metrics = evaluate_with_noise(params_for_eval, inputs, targets, mask, 0.0)
+            log_prefix = f"features/generalization/length_x{factor:.2f}"
+            payload = {
+                "step": step_index,
+                f"{log_prefix}/nll": float(metrics["nll"]),
+                f"{log_prefix}/accuracy": float(metrics["accuracy"]),
+            }
+            logged_metrics.update({k: v for k, v in payload.items() if k != "step"})
+            wandb.log(payload)
+        return logged_metrics
+
+    def run_noise_generalization(step_index: int, params_for_eval) -> Dict[str, float]:
+        logged_metrics: Dict[str, float] = {}
+        if not noise_generalization_stddevs:
+            return logged_metrics
+        nonlocal generalization_rng
+        for std in noise_generalization_stddevs:
+            if std is None or std < 0.0:
+                continue
+            generalization_rng, noise_key = jax.random.split(generalization_rng)
+            inputs, targets, mask = dataset()
+            metrics = evaluate_with_noise(
+                params_for_eval, inputs, targets, mask, float(std), noise_key
+            )
+            log_prefix = f"features/generalization/noise_{float(std):.3f}"
+            payload = {
+                "step": step_index,
+                f"{log_prefix}/nll": float(metrics["nll"]),
+                f"{log_prefix}/accuracy": float(metrics["accuracy"]),
+            }
+            logged_metrics.update({k: v for k, v in payload.items() if k != "step"})
+            wandb.log(payload)
+        return logged_metrics
 
     # Track best metric value for checkpointing
     best_metric_value = None
@@ -608,6 +695,14 @@ def train_copy(
                         for name, value in last_feature_metrics.items()
                     )
                 )
+            if last_generalization_metrics:
+                print(
+                    "  gen  ┆ "
+                    + " │ ".join(
+                        f"{name}: {value:.4f}"
+                        for name, value in last_generalization_metrics.items()
+                    )
+                )
             print("-" * 80)
         else:
             maybe_log_features(step_index, model_params, input_sequence, attention_mask)
@@ -665,6 +760,15 @@ def train_copy(
                 "eval/nll": aggregated_eval_metrics["nll"],
                 "eval/accuracy": aggregated_eval_metrics["accuracy"],
             }
+            generalization_metrics: Dict[str, float] = {}
+            generalization_metrics.update(
+                run_length_generalization(step_index, model_params)
+            )
+            generalization_metrics.update(
+                run_noise_generalization(step_index, model_params)
+            )
+            if generalization_metrics:
+                last_generalization_metrics = generalization_metrics
             if jacobian_batch is not None and not train_cfg.sweep_run:
                 log_jacobian_figure(step_index, model_params, *jacobian_batch)
 

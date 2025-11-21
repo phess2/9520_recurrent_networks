@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Tuple
 
 
 OptimizerName = Literal["adamw", "sgd", "muon"]
@@ -39,6 +39,8 @@ class TrainLoopConfig:
     disable_checkpointing: bool = False
     sweep_run: bool = False
     weight_checkpoint_dir: str = "weight_checkpoints"
+    length_generalization_fractions: Tuple[float, ...] | None = None
+    noise_generalization_stddevs: Tuple[float, ...] | None = None
 
 
 @dataclass
