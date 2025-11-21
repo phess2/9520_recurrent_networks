@@ -35,7 +35,13 @@ from .train_base import (
     validate_precisions,
 )
 
+# Configure logging for orbax checkpointing
 configure_orbax_logging()
+
+
+# ============================================================================
+# Metric computation utilities
+# ============================================================================
 
 
 def compute_metrics(
@@ -107,6 +113,9 @@ def train_copy(
     it after a delay period. This tests the model's ability to maintain information
     in its hidden state over time.
     """
+    # ========================================================================
+    # Setup: Initialize wandb, dataset, model, optimizer, and checkpointing
+    # ========================================================================
     run_identifier, hydra_run_dir = initialize_wandb_run(
         train_cfg, task_cfg, model_cfg, optimizer_cfg
     )
@@ -119,12 +128,14 @@ def train_copy(
         seq_length=int(task_cfg.get("seq_length", 10)),
     )
 
+    # Extract task dimensions and vocabulary size
     vocab_size = int(task_cfg["num_classes"])
     num_classes = vocab_size
     input_dim = int(task_cfg.get("input_dim", vocab_size))
     output_dim = int(task_cfg.get("output_dim", vocab_size))
     task_dims = {"input_dim": input_dim, "output_dim": output_dim}
 
+    # Build model and validate precision settings
     model, model_config = build_model(model_cfg, train_cfg, task_dims)
     validate_precisions(model_config, train_cfg)
 
@@ -135,16 +146,21 @@ def train_copy(
     random_key = jax.random.PRNGKey(train_cfg.seed)
     model_params = model.initialize(random_key)
     optimizer_state = optimizer.init(model_params)
+
+    # Configure feature logging (for models that support analyze_batch)
     supports_feature_logging = hasattr(model, "analyze_batch")
     feature_log_every = int(getattr(train_cfg, "feature_log_every", 0) or 0)
     feature_log_batches = max(1, int(getattr(train_cfg, "feature_log_max_batches", 1)))
     feature_save_dir = train_cfg.feature_save_dir
     if feature_save_dir:
         os.makedirs(feature_save_dir, exist_ok=True)
+
+    # Track metrics and timing for logging
     last_feature_metrics: Dict[str, float] | None = None
     last_eval_metrics: Dict[str, float] | None = None
     start_time = time.time()
 
+    # Setup checkpointing and artifact directories
     dataset_name = "copy"
     architecture_name = re.sub(
         r"(?<!^)(?=[A-Z])", "_", model.__class__.__name__
@@ -156,6 +172,10 @@ def train_copy(
         train_cfg, hydra_run_dir, dataset_name, architecture_name, run_identifier
     )
     jacobian_eval_history: List[Dict[str, Any]] = []
+
+    # ========================================================================
+    # Helper functions: Input embedding and training/evaluation steps
+    # ========================================================================
 
     def embed_inputs(token_ids: jnp.ndarray) -> jnp.ndarray:
         embedded = jax.nn.one_hot(token_ids, input_dim, dtype=jnp.float32)
@@ -185,7 +205,7 @@ def train_copy(
             return metrics["nll"], metrics
 
         # Compute gradients and loss value simultaneously
-        (negative_log_likelihood, metrics), gradients = jax.value_and_grad(
+        (_, metrics), gradients = jax.value_and_grad(
             loss_fn, has_aux=True
         )(model_params)
 
@@ -205,7 +225,6 @@ def train_copy(
         # Shift targets for next-token prediction
         shifted_target_ids, shifted_target_mask = shift_targets(targets, mask)
 
-        embedded_inputs = jax.nn.one_hot(inputs, input_dim, dtype=jnp.float32)
         embedded_inputs = embed_inputs(inputs)
 
         # Forward pass: get predictions
@@ -215,6 +234,10 @@ def train_copy(
         metrics = compute_metrics(logits, shifted_target_ids, shifted_target_mask)
 
         return metrics
+
+    # ========================================================================
+    # Checkpointing: Save best model based on evaluation metric
+    # ========================================================================
 
     # Track best metric value for checkpointing
     best_metric_value = None
@@ -265,12 +288,17 @@ def train_copy(
                     ),
                 )
 
+    # ========================================================================
+    # Feature logging: Extract and log internal model statistics
+    # ========================================================================
+
     def maybe_log_features(
         step_index: int,
         model_params,
         input_ids: jnp.ndarray,
         mask: jnp.ndarray,
     ):
+        # Early returns: skip if sweep run, not scheduled, or model doesn't support it
         if train_cfg.sweep_run:
             return None
         if feature_log_every <= 0 or (step_index % feature_log_every) != 0:
@@ -278,6 +306,7 @@ def train_copy(
         if not supports_feature_logging:
             return None
 
+        # Initialize accumulators for aggregating statistics across batches
         mask_total = 0.0
         frob_sum = 0.0
         active_sum = 0.0
@@ -287,11 +316,13 @@ def train_copy(
         sigma_max_value = None
         payload_to_save = None
 
+        # Process batches to extract internal model statistics
         def process(ids, mask_arr):
             embedded = embed_inputs(ids)
             _, tensors, stats = model.analyze_batch(model_params, embedded, mask_arr)
             return tensors, stats
 
+        # Aggregate statistics across multiple batches for more stable estimates
         for idx in range(feature_log_batches):
             if idx == 0:
                 ids = input_ids
@@ -331,6 +362,7 @@ def train_copy(
 
         if mask_total <= 0:
             return None
+        # Compute averaged metrics from accumulated statistics
         eps = 1e-6
         feature_metrics = {
             "features/frobenius_mean": frob_sum / (mask_total + eps),
@@ -348,6 +380,10 @@ def train_copy(
             np.savez(save_path, **payload_np)
         return feature_metrics
 
+    # ========================================================================
+    # Visualization: Create plots for predictions and Jacobian analysis
+    # ========================================================================
+
     def create_prediction_figure(
         model_params,
         input_ids: jnp.ndarray,
@@ -355,21 +391,25 @@ def train_copy(
         attention_mask: jnp.ndarray,
         example_idx: int = 0,
     ):
+        # Generate predictions for visualization
         embedded_inputs = embed_inputs(input_ids)
         logits = model.apply(model_params, embedded_inputs, attention_mask)
         predictions = jnp.argmax(logits, axis=-1)
 
+        # Convert JAX arrays to numpy for plotting
         inputs_np = np.asarray(jax.device_get(input_ids))
         targets_np = np.asarray(jax.device_get(target_ids))
         preds_np = np.asarray(jax.device_get(predictions))
         mask_np = np.asarray(jax.device_get(attention_mask)).astype(bool)
 
+        # Extract single example for visualization
         example_idx = int(np.clip(example_idx, 0, inputs_np.shape[0] - 1))
         inp = inputs_np[example_idx]
         tgt = targets_np[example_idx]
         pred = preds_np[example_idx]
         valid = mask_np[example_idx]
 
+        # Create 4-panel figure: input, target, prediction, mask
         fig, axes = plt.subplots(4, 1, figsize=(14, 8), sharex=True)
         axes[0].imshow(
             inp[None, :], aspect="auto", cmap="tab20", vmin=0, vmax=num_classes
@@ -426,6 +466,7 @@ def train_copy(
         fig.savefig(figure_path)
         plt.close(fig)
 
+    # Compute Jacobian statistics (Frobenius norms) across time steps
     def compute_jacobian_stats(
         model_params,
         input_ids: jnp.ndarray,
@@ -543,7 +584,10 @@ def train_copy(
             logging.exception("Failed to log jacobian summary to wandb.")
         plt.close(fig)
 
-    # Main training loop
+    # ========================================================================
+    # Main training loop: Iterate over training steps
+    # ========================================================================
+
     for step_index in range(1, train_cfg.steps + 1):
         # Get a batch of training data (now includes mask)
         input_sequence, target_sequence, attention_mask = dataset()
@@ -576,12 +620,8 @@ def train_copy(
                 last_feature_metrics = feature_stats
 
             elapsed = time.time() - start_time
-            speed = elapsed / step_index if step_index > 0 else float("inf")
-            eta = (
-                (train_cfg.steps - step_index) * speed
-                if step_index > 0
-                else float("inf")
-            )
+            speed = elapsed / step_index
+            eta = (train_cfg.steps - step_index) * speed
             print(
                 f"\nStep {step_index}/{train_cfg.steps}  ({format_hms(elapsed)} elapsed, {format_hms(eta)} ETA)"
             )
@@ -611,13 +651,17 @@ def train_copy(
         else:
             maybe_log_features(step_index, model_params, input_sequence, attention_mask)
 
-        # Run evaluation periodically
+        # ====================================================================
+        # Evaluation: Compute metrics on validation batches
+        # ====================================================================
         if step_index % train_cfg.eval_every == 0:
             # Aggregate metrics over multiple evaluation batches for more stable estimates
             aggregated_eval_metrics = {"nll": 0.0, "accuracy": 0.0}
+            # Store first batch for visualization purposes
             prediction_batch: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray] | None = None
             jacobian_batch: tuple[jnp.ndarray, jnp.ndarray] | None = None
 
+            # Evaluate on multiple batches and average results
             for _ in range(train_cfg.eval_steps):
                 eval_inputs, eval_targets, eval_mask = dataset()
                 if prediction_batch is None:
@@ -672,7 +716,10 @@ def train_copy(
                 ),
             )
 
-    # Log final prediction visualization
+    # ========================================================================
+    # Finalization: Generate final visualizations and summaries
+    # ========================================================================
+
     if not train_cfg.sweep_run:
         final_inputs, final_targets, final_mask = dataset()
         log_prediction_figure(
@@ -682,81 +729,13 @@ def train_copy(
             log_jacobian_figure(train_cfg.steps, model_params, final_inputs, final_mask)
         log_final_jacobian_summary()
 
-    def maybe_log_features(
-        step_index: int,
-        model_params,
-        input_ids: jnp.ndarray,
-        mask: jnp.ndarray,
-    ):
-        if feature_log_every <= 0 or (step_index % feature_log_every) != 0:
-            return
-        if not supports_feature_logging:
-            return
-
-        mask_total = 0.0
-        frob_sum = 0.0
-        active_sum = 0.0
-        scaling_sum = 0.0
-        scaling_count = 0.0
-        lambda_max_value = None
-        sigma_max_value = None
-        payload_to_save = None
-
-        def process(ids, mask_arr):
-            embedded = embed_inputs(ids)
-            _, tensors, stats = model.analyze_batch(model_params, embedded, mask_arr)
-            return tensors, stats
-
-        for idx in range(feature_log_batches):
-            if idx == 0:
-                ids = input_ids
-                mask_arr = mask
-            else:
-                ids, _, mask_arr = dataset()
-            tensors, stats = process(ids, mask_arr)
-            mask_arr = mask_arr.astype(jnp.float32)
-            mask_total += float(jnp.sum(mask_arr))
-            frob_sum += float(jnp.sum(stats.frobenius_norms * mask_arr))
-            active_sum += float(jnp.sum(stats.nonlinearity_active_fraction))
-            scaling_sum += float(jnp.sum(stats.nonlinearity_scaling))
-            scaling_count += float(
-                jnp.sum(mask_arr) * stats.nonlinearity_scaling.shape[-1]
-            )
-            if lambda_max_value is None:
-                lambda_max_value = float(stats.max_eigenvalue)
-            if sigma_max_value is None:
-                sigma_max_value = float(stats.max_singular_value)
-            if payload_to_save is None and feature_save_dir:
-                payload_to_save = {
-                    "frobenius_norms": stats.frobenius_norms,
-                    "active_fraction": stats.nonlinearity_active_fraction,
-                    "scaling": stats.nonlinearity_scaling,
-                    "pre_activations": tensors.pre_activations,
-                    "hidden_states": tensors.hidden_states,
-                    "lambda_max": stats.max_eigenvalue,
-                    "max_singular_value": stats.max_singular_value,
-                }
-
-        if mask_total <= 0:
-            return
-        eps = 1e-6
-        feature_metrics = {
-            "features/frobenius_mean": frob_sum / (mask_total + eps),
-            "features/nonlinearity_active_fraction": active_sum / (mask_total + eps),
-            "features/nonlinearity_scale_mean": scaling_sum / (scaling_count + eps),
-        }
-        if lambda_max_value is not None:
-            feature_metrics["features/lambda_max"] = lambda_max_value
-        if sigma_max_value is not None:
-            feature_metrics["features/max_singular_value"] = sigma_max_value
-        wandb.log({"step": step_index, **feature_metrics})
-        if payload_to_save is not None:
-            save_path = os.path.join(feature_save_dir, f"step_{step_index:06d}.npz")
-            payload_np = jax.device_get(payload_to_save)
-            np.savez(save_path, **payload_np)
-
     # Finalize wandb run
     wandb.finish()
+
+
+# ============================================================================
+# Entry point: Hydra configuration and training invocation
+# ============================================================================
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="copy")
