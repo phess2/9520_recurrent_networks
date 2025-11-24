@@ -125,15 +125,16 @@ class ElmanRNN(BaseSequenceModel):
     def __init__(
         self,
         config: ModelConfig,
-        nonlinearity: str = "relu",
+        nonlinearity: str | None = None,
         nonlinearity_kwargs: Dict[str, Any] | None = None,
     ):
         """
         Initializes ElmanRNN with specified configuration and activation function.
         """
         super().__init__(config)
+        resolved_nonlinearity = nonlinearity or config.rnn_nonlinearity or "relu"
         self._nonlinearity: Nonlinearity = get_nonlinearity(
-            nonlinearity, **(nonlinearity_kwargs or {})
+            resolved_nonlinearity, **(nonlinearity_kwargs or {})
         )
         self.param_dtype = _resolve_dtype(config.param_dtype or config.precision)
         self.use_layer_norm = config.use_layer_norm
@@ -507,15 +508,16 @@ class UnitaryRNN(BaseSequenceModel):
     def __init__(
         self,
         config: ModelConfig,
-        nonlinearity: str = "tanh",
+        nonlinearity: str | None = None,
         nonlinearity_kwargs: Dict[str, Any] | None = None,
     ):
         """
         Initializes UnitaryRNN with specified configuration and activation function.
         """
         super().__init__(config)
+        resolved_nonlinearity = nonlinearity or config.rnn_nonlinearity or "tanh"
         self._nonlinearity: Nonlinearity = get_nonlinearity(
-            nonlinearity, **(nonlinearity_kwargs or {})
+            resolved_nonlinearity, **(nonlinearity_kwargs or {})
         )
         self.param_dtype = _resolve_dtype(config.param_dtype or config.precision)
         self.use_layer_norm = config.use_layer_norm

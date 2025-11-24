@@ -41,6 +41,10 @@ def build_model(
     num_layers = int(model_dict.get("num_layers", 1))
     precision = str(model_dict.get("precision", train_cfg.precision))
     param_dtype = str(model_dict.get("param_dtype", precision))
+    use_layer_norm = bool(model_dict.get("use_layer_norm", False))
+    rnn_nonlinearity = model_dict.get("rnn_nonlinearity")
+    if isinstance(rnn_nonlinearity, str):
+        rnn_nonlinearity = rnn_nonlinearity.strip() or None
 
     model_config = ModelConfig(
         input_dim=input_dim,
@@ -49,6 +53,8 @@ def build_model(
         num_layers=num_layers,
         precision=precision,
         param_dtype=param_dtype,
+        use_layer_norm=use_layer_norm,
+        rnn_nonlinearity=rnn_nonlinearity,
     )
 
     kwargs = model_dict.get("kwargs") or {}

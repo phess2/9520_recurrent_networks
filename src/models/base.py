@@ -19,6 +19,7 @@ class ModelConfig:
     precision: str = "bfloat16"  # "float32" or "bfloat16"
     param_dtype: str | None = None
     use_layer_norm: bool = False
+    rnn_nonlinearity: str | None = None
 
 
 class BaseSequenceModel:

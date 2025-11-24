@@ -1,6 +1,6 @@
 defaults:
-  - task: copy
-  - model: lstm
+  - task: copy_lag10
+  - model: rnn
   - optimizer: adamw
   - train: copy_default
   # - override hydra/launcher: submitit_slurm

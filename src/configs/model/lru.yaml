@@ -4,4 +4,5 @@ num_layers: 1
 precision: ${train.precision}
 param_dtype: ${train.precision}
 mlp_hidden_dim: 64
+rnn_nonlinearity:
 
