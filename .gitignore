@@ -227,3 +227,6 @@ submit_scripts/
 *.png
 
 multirun/
+
+jacobian_plots/
+weight_checkpoints/

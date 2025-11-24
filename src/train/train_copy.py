@@ -367,10 +367,11 @@ def train_copy(
             # Log best metric to wandb summary
             wandb.run.summary["best_" + train_cfg.ckpt_metric] = current_metric_value
 
-            # Save checkpoint if checkpointing is enabled
+            # Save checkpoint if checkpointing is enabled and not a sweep run
             if (
                 train_cfg.save_best
                 and not train_cfg.disable_checkpointing
+                and not train_cfg.sweep_run
                 and checkpoint_manager is not None
             ):
                 checkpoint_manager.save(
@@ -800,14 +801,17 @@ def train_copy(
             maybe_save_best(
                 step_index, metrics_for_checkpoint, model_params, optimizer_state
             )
-            save_weight_checkpoint(
-                model,
-                model_params,
-                train_cfg,
-                dataset_name,
-                architecture_name,
-                step_index,
-            )
+            if not train_cfg.sweep_run:
+                save_weight_checkpoint(
+                    model,
+                    model_params,
+                    train_cfg,
+                    dataset_name,
+                    architecture_name,
+                    step_index,
+                    lr=optimizer_cfg.lr,
+                    weight_decay=optimizer_cfg.weight_decay,
+                )
             last_eval_metrics = {
                 "eval/nll": aggregated_eval_metrics["nll"],
                 "eval/accuracy": aggregated_eval_metrics["accuracy"],
@@ -828,6 +832,7 @@ def train_copy(
         if (
             step_index % train_cfg.ckpt_every == 0
             and not train_cfg.disable_checkpointing
+            and not train_cfg.sweep_run
             and checkpoint_manager is not None
         ):
             checkpoint_manager.save(

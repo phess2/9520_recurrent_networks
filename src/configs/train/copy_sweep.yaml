@@ -1,6 +1,6 @@
 project: recurrent_networks_copy
 run_name: hess_copy_${model.architecture}_${model.hidden_dim}_${optimizer.lr}_${optimizer.weight_decay}
-steps: 50000
+steps: 25000
 log_every: 500
 eval_every: 5000
 eval_steps: 1000

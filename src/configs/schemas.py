@@ -41,7 +41,7 @@ class TrainLoopConfig:
     weight_checkpoint_dir: str = "weight_checkpoints"
     length_generalization_fractions: Tuple[float, ...] | None = None
     noise_generalization_stddevs: Tuple[float, ...] | None = None
-
+    official_run: bool = False
 
 @dataclass
 class FeatureEvalConfig:

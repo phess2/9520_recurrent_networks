@@ -149,16 +149,32 @@ def save_weight_checkpoint(
     dataset_name: str,
     architecture_name: str,
     step_index: int,
+    lr: float | None = None,
+    weight_decay: float | None = None,
 ) -> Optional[str]:
-    """Persist model weights using the lightweight serialization hook."""
+    """Persist model weights using the lightweight serialization hook.
+    
+    If lr and weight_decay are provided, saves to:
+        {target_dir}/{dataset_name}/{architecture_name}/{lr}_{weight_decay}/{step_index}/
+    Otherwise, saves to:
+        {target_dir}/{dataset_name}/{architecture_name}/step_{step_index:06d}.pkl
+    """
     target_dir = getattr(train_cfg, "weight_checkpoint_dir", "weight_checkpoints")
     if not target_dir:
         return None
-    checkpoint_dir = (
-        Path(target_dir).expanduser().resolve() / dataset_name / architecture_name
-    )
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = checkpoint_dir / f"step_{step_index:06d}.pkl"
+    
+    base_dir = Path(target_dir).expanduser().resolve() / dataset_name / architecture_name
+    
+    if lr is not None and weight_decay is not None:
+        # New directory structure: {lr}_{weight_decay}/{step_index}/
+        lr_wd_dir = base_dir / f"{lr}_{weight_decay}" / str(step_index)
+        lr_wd_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_path = lr_wd_dir / "weights.pkl"
+    else:
+        # Legacy directory structure
+        base_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_path = base_dir / f"step_{step_index:06d}.pkl"
+    
     saved_path = model.save_weights(params, checkpoint_path)
     logging.info("Saved weight checkpoint to %s", saved_path)
     return saved_path
