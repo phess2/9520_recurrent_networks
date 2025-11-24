@@ -219,6 +219,7 @@ def train_kbit(
             if (
                 train_cfg.save_best
                 and not train_cfg.disable_checkpointing
+                and not train_cfg.sweep_run
                 and checkpoint_manager is not None
             ):
                 checkpoint_manager.save(
@@ -379,7 +380,9 @@ def train_kbit(
         try:
             wandb.run.summary["prediction_plot"] = wandb.Image(fig, caption=caption)
         except Exception:
-            logging.exception("Failed to log prediction visualization to wandb summary.")
+            logging.exception(
+                "Failed to log prediction visualization to wandb summary."
+            )
         figure_path = os.path.join(
             prediction_plot_dir, f"prediction_step_{step_index:06d}.png"
         )
@@ -579,9 +582,13 @@ def train_kbit(
                     prediction_batch = (eval_inputs, eval_targets, eval_mask)
                 if jacobian_batch is None:
                     jacobian_batch = (eval_inputs, eval_mask)
-                eval_metrics = eval_step(model_params, eval_inputs, eval_targets, eval_mask)
+                eval_metrics = eval_step(
+                    model_params, eval_inputs, eval_targets, eval_mask
+                )
                 for key in aggregated_eval_metrics:
-                    aggregated_eval_metrics[key] += float(eval_metrics[key]) / train_cfg.eval_steps
+                    aggregated_eval_metrics[key] += (
+                        float(eval_metrics[key]) / train_cfg.eval_steps
+                    )
 
             wandb.log(
                 {
@@ -598,14 +605,17 @@ def train_kbit(
             maybe_save_best(
                 step_index, metrics_for_checkpoint, model_params, optimizer_state
             )
-            save_weight_checkpoint(
-                model,
-                model_params,
-                train_cfg,
-                dataset_name,
-                architecture_name,
-                step_index,
-            )
+            if not train_cfg.sweep_run:
+                save_weight_checkpoint(
+                    model,
+                    model_params,
+                    train_cfg,
+                    dataset_name,
+                    architecture_name,
+                    step_index,
+                    lr=optimizer_cfg.lr,
+                    weight_decay=optimizer_cfg.weight_decay,
+                )
             last_eval_metrics = {
                 "eval/mse": aggregated_eval_metrics["mse"],
                 "eval/mae": aggregated_eval_metrics["mae"],
@@ -620,12 +630,13 @@ def train_kbit(
             )
             if generalization_metrics:
                 last_generalization_metrics = generalization_metrics
-            if jacobian_batch is not None:
+            if jacobian_batch is not None and not train_cfg.sweep_run:
                 log_jacobian_figure(step_index, model_params, *jacobian_batch)
 
         if (
             step_index % train_cfg.ckpt_every == 0
             and not train_cfg.disable_checkpointing
+            and not train_cfg.sweep_run
             and checkpoint_manager is not None
         ):
             checkpoint_manager.save(
@@ -661,4 +672,3 @@ def main(cfg: DictConfig) -> None:
 
 if __name__ == "__main__":
     main()
-

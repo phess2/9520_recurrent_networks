@@ -1,7 +1,6 @@
 kind: kbit_flipflop
 k: 4
 seq_length: 256
-batch_size: 64
+batch_size: 256
 p: 0.05
 noise_std: 0.1
-
