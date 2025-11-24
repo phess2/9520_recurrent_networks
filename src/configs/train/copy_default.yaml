@@ -1,5 +1,5 @@
 project: recurrent_networks_copy
-run_name: hess_copy_${model.architecture}_${model.hidden_dim}_${optimizer.lr}
+run_name: ostrow_copy_${model.architecture}_${model.hidden_dim}_${optimizer.lr}
 steps: 50000
 log_every: 50
 eval_every: 50
