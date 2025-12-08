@@ -429,18 +429,61 @@ def train_kbit(
         )
         mean = np.array(mean, dtype=np.float32)
         std = np.array(std, dtype=np.float32)
+
+        # Filter out non-finite values for plotting
+        finite_mask = np.isfinite(mean) & np.isfinite(std)
+        if not np.any(finite_mask):
+            logging.warning(
+                f"All jacobian values are non-finite at step {step_index}. Skipping plot."
+            )
+            return
+
+        # Use only finite values for computing limits
+        mean_finite = mean[finite_mask]
+        std_finite = std[finite_mask]
+        time_points_finite = np.array(time_points)[finite_mask]
+
         fig, ax = plt.subplots(figsize=(10, 5))
-        ax.plot(time_points, mean, label=f"Step {step_index}")
-        ax.fill_between(time_points, mean - std, mean + std, alpha=0.3)
+        ax.plot(time_points_finite, mean_finite, label=f"Step {step_index}")
+        ax.fill_between(
+            time_points_finite,
+            mean_finite - std_finite,
+            mean_finite + std_finite,
+            alpha=0.3,
+        )
         ax.set_title("Jacobian Frobenius Norm Across Sequence")
         ax.set_xlabel("Time step")
         ax.set_ylabel("Frobenius norm")
         ax.legend(loc="upper right")
         ax.set_yscale("log")
-        upper = float(np.max(mean + std) + 1e-6)
-        lower = float(np.min(np.maximum(mean - std, 1e-8)))
-        lower = max(lower, 1e-8)
-        ax.set_ylim(lower, upper)
+
+        # Compute limits with protection against non-finite values
+        mean_plus_std = mean_finite + std_finite
+        mean_minus_std = mean_finite - std_finite
+
+        # Get finite values only for limit computation
+        finite_upper = mean_plus_std[np.isfinite(mean_plus_std)]
+        finite_lower = mean_minus_std[np.isfinite(mean_minus_std)]
+
+        if len(finite_upper) > 0 and len(finite_lower) > 0:
+            upper = float(np.max(finite_upper) + 1e-6)
+            lower = float(np.min(np.maximum(finite_lower, 1e-8)))
+            lower = max(lower, 1e-8)
+
+            # Final check: ensure limits are finite
+            if np.isfinite(upper) and np.isfinite(lower) and upper > lower:
+                ax.set_ylim(lower, upper)
+            else:
+                logging.warning(
+                    f"Computed ylim values are non-finite at step {step_index}. "
+                    f"Using default limits."
+                )
+        else:
+            logging.warning(
+                f"No finite values for ylim computation at step {step_index}. "
+                f"Using default limits."
+            )
+
         ax.grid(True, linestyle="--", alpha=0.3)
         fig.tight_layout()
 

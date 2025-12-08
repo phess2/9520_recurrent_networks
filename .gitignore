@@ -230,3 +230,6 @@ multirun/
 
 jacobian_plots/
 weight_checkpoints/
+prediction_plots/
+feature_logs/
+outputs/

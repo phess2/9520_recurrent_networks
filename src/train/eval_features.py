@@ -125,17 +125,19 @@ def evaluate(
             metrics_accum[k] += float(metrics.get(k, 0.0)) / eval_cfg.num_batches
         if supports_features:
             _, tensors, stats = model.analyze_batch(params, obs, mask)
-            arrays = jax.device_get(
-                {
-                    "frobenius_norms": stats.frobenius_norms,
-                    "nonlinearity_active_fraction": stats.nonlinearity_active_fraction,
-                    "nonlinearity_scaling": stats.nonlinearity_scaling,
-                    "pre_activations": tensors.pre_activations,
-                    "hidden_states": tensors.hidden_states,
-                    "lambda_max": stats.max_eigenvalue,
-                    "max_singular_value": stats.max_singular_value,
-                }
-            )
+            arrays_dict = {
+                "frobenius_norms": stats.frobenius_norms,
+                "nonlinearity_active_fraction": stats.nonlinearity_active_fraction,
+                "nonlinearity_scaling": stats.nonlinearity_scaling,
+                "pre_activations": tensors.pre_activations,
+                "hidden_states": tensors.hidden_states,
+                "lambda_max": stats.max_eigenvalue,
+                "max_singular_value": stats.max_singular_value,
+            }
+            # Add l_eff if it was computed
+            if stats.l_eff is not None:
+                arrays_dict["l_eff"] = stats.l_eff
+            arrays = jax.device_get(arrays_dict)
             save_path = os.path.join(eval_cfg.output_dir, f"batch_{batch_idx:04d}.npz")
             if eval_cfg.save_raw_tensors:
                 np.savez(save_path, **arrays)
@@ -181,6 +183,24 @@ def main(cfg: DictConfig) -> None:
                 [np.mean(rec["max_singular_value"]) for rec in feature_records]
             ),
         }
+
+        # Aggregate l_eff if it was computed
+        # Default epsilon values used in compute_jacobian_features
+        default_epsilons = (0.1, 0.3, 0.5, 0.7, 0.9)
+        if feature_records and "l_eff" in feature_records[0]:
+            # l_eff has shape [B, T, num_epsilons]
+            # Compute mean across batches and time steps for each epsilon
+            l_eff_arrays = [rec["l_eff"] for rec in feature_records]
+            # Stack all batches: [total_batches*B, T, num_epsilons]
+            l_eff_combined = np.concatenate(l_eff_arrays, axis=0)
+            # Compute mean across batch and time dimensions: [num_epsilons]
+            l_eff_means = np.mean(l_eff_combined, axis=(0, 1))
+
+            # Add to summary with epsilon value in the key
+            for eps_idx, eps_val in enumerate(default_epsilons):
+                if eps_idx < len(l_eff_means):
+                    means[f"l_eff_epsilon_{eps_val}_mean"] = float(l_eff_means[eps_idx])
+
         np.savez(summary_path, **means)
         print(f"Saved feature artifacts to {eval_cfg.output_dir}")
     else:
