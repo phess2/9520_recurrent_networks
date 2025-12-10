@@ -1,0 +1,14 @@
+project: recurrent_networks_dgm
+run_name: debug
+steps: 1000
+log_every: 50
+eval_every: 200
+eval_steps: 10
+ckpt_every: 200
+ckpt_metric: nll
+save_best: true
+precision: bfloat16
+entity: your-team-name
+seed: 0
+wandb_api_key:
+

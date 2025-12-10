@@ -3,6 +3,7 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+
 # C extensions
 *.so
 
@@ -212,6 +213,23 @@ wandb/
 #Checkpoints
 checkpoints/
 
+# hydra
+outputs/
+multirun/
+*.out
+
 # slurm logs
 outLogs/
 submit_scripts/
+
+#other files:
+*.npz
+*.png
+
+multirun/
+
+jacobian_plots/
+weight_checkpoints/
+prediction_plots/
+feature_logs/
+outputs/

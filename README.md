@@ -22,7 +22,7 @@ Repo Structure
   - train/: Training loop, evaluation, checkpointing
   - configs/: Simple dataclass configs for datasets/models/training
   - utils/: Metrics, logging, capacity estimators
-- scripts/: CLI helpers to launch training and evaluation
+- scripts/: CLI helpers to launch training and evaluation (see `scripts/copy_multirun.sh` for a ready-to-submit Slurm multirun example)
 - tests/: Pytest smoke tests for datasets, models, training
 
 References

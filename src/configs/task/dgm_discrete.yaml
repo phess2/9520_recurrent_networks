@@ -1,0 +1,12 @@
+kind: dgm
+dims: 4
+obs_dims: 8
+lags: [1]
+discrete_latent: true
+num_categories: 8
+mean_seq_len: 128
+std_seq_len: 0
+batch_size: 32
+burn_in: 16
+seed: 0
+cov_scale: 0.2

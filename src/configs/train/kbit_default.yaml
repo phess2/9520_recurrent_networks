@@ -1,0 +1,21 @@
+project: recurrent_networks_kbit
+run_name: ostrow_kbit_${model.architecture}_${model.hidden_dim}_${task.k}
+steps: 10000
+log_every: 50
+eval_every: 250
+eval_steps: 200
+ckpt_every: 500
+ckpt_metric: mse
+save_best: true
+precision: bfloat16
+entity: phess2-massac
+seed: 0
+wandb_api_key: 172a4c57ff0779bfbe96de3da444e9851729e3d9
+feature_log_every: 200
+feature_log_max_batches: 1
+feature_save_dir: feature_logs/kbit_flipflop
+noise_generalization_stddevs:
+  - 0.0
+  - 0.02
+  - 0.05
+

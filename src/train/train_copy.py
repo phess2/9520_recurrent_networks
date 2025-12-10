@@ -1,243 +1,49 @@
 from __future__ import annotations
 
-import argparse
 import json
 import logging
+import math
 import os
-import sys
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Dict, Literal
+import re
+import time
+from typing import Any, Dict, List, Tuple
 
-# Handle relative imports when running as script
-# Add project root to path before other imports
-_script_path = Path(__file__).resolve()
-_project_root = _script_path.parent.parent.parent
-if str(_project_root) not in sys.path:
-    sys.path.insert(0, str(_project_root))
+import hydra
+import jax
+import jax.numpy as jnp
+import matplotlib
+import numpy as np
+import optax
+import orbax.checkpoint as ocp
+from omegaconf import DictConfig, OmegaConf
 
-# Imports after sys.path modification to allow both module and script execution
-import jax  # noqa: E402
-import jax.numpy as jnp  # noqa: E402
-import optax  # noqa: E402
-import orbax.checkpoint as ocp  # noqa: E402
+import wandb
 
-import wandb  # noqa: E402
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
-# Try relative imports first (when run as module), fall back to absolute (when run as script)
-try:
-    from ..data.copy_dataset import CopyDataset
-    from ..models.base import BaseSequenceModel, ModelConfig
-    from ..models.rnn import ElmanRNN, LSTM
-    from ..models.lru import LinearRecurrentUnit
-    from ..models.transformer import TransformerAdapter
-except ImportError:
-    # Fall back to absolute imports when running as script
-    from src.data.copy_dataset import CopyDataset
-    from src.models.base import BaseSequenceModel, ModelConfig
-    from src.models.rnn import ElmanRNN, LSTM
-    from src.models.lru import LinearRecurrentUnit
-    from src.models.transformer import TransformerAdapter
+from ..configs.schemas import OptimizerConfig, TrainLoopConfig
+from ..data.copy_dataset import CopyDataset
+from .model_factory import build_model
+from .train_base import (
+    build_optimizer,
+    configure_orbax_logging,
+    create_checkpoint_manager,
+    ensure_prediction_artifacts,
+    format_hms,
+    initialize_wandb_run,
+    maybe_cast_precision,
+    save_weight_checkpoint,
+    validate_precisions,
+)
 
-
-# Suppress Orbax checkpointing warnings about blocking main thread
-# These warnings are informational and don't indicate an error
-class OrbaxWarningFilter(logging.Filter):
-    """Filter to suppress Orbax _SignalingThread.join() warnings."""
-
-    def filter(self, record):
-        # Suppress warnings about _SignalingThread.join() blocking the main thread
-        if "_SignalingThread.join()" in record.getMessage():
-            return False
-        return True
+# Configure logging for orbax checkpointing
+configure_orbax_logging()
 
 
-# Apply filter to absl logger (where Orbax warnings come from)
-absl_logger = logging.getLogger("absl")
-absl_logger.addFilter(OrbaxWarningFilter())
-
-# Type aliases for optimizer and scheduler names
-OptimizerName = Literal["adamw", "sgd", "muon"]
-SchedulerName = Literal["linear", "cosine"]
-
-
-@dataclass
-class CopyTrainConfig:
-    """Configuration for training an RNN on the copy task.
-
-    The copy task tests a model's ability to remember and reproduce a sequence
-    after a delay period (lag). The lag is sampled uniformly from [min_lag, max_lag]
-    for each batch, and the copy sequence length is sampled uniformly from
-    [min_copy_length, max_copy_length], providing a range of difficulty levels.
-    This is a classic benchmark for recurrent networks.
-    """
-
-    # Wandb logging configuration
-    project: str = "recurrent_networks_copy"
-    run_name: str = ""  # Will be set to hess_copy_{model_name} if empty
-
-    # Model configuration
-    model_name: str = "elman_rnn"  # Options: "elman_rnn", "lstm", "lru", "transformer"
-    model_kwargs: Dict[str, Any] = field(
-        default_factory=dict
-    )  # Additional kwargs for model initialization
-
-    # Training loop configuration
-    steps: int = 5000
-    log_every: int = steps // 100  # Log training metrics every N steps
-    eval_every: int = steps // 10  # Run evaluation every N steps
-    eval_steps: int = steps // 5  # Number of batches to evaluate over
-
-    # Checkpointing configuration
-    ckpt_every: int = steps // 20  # Save checkpoint every N steps
-    ckpt_metric: str = (
-        "accuracy"  # Metric to track for best model ("accuracy" or "nll")
-    )
-    save_best: bool = True  # Whether to save best model based on ckpt_metric
-    save_periodic_checkpoints: bool = False  # Whether to save periodic checkpoints (in addition to best model)
-
-    # Model precision
-    precision: str = "bfloat16"
-
-    # Optimizer configuration
-    optimizer: OptimizerName = "adamw"
-    lr: float = 1e-3  # Learning rate
-    weight_decay: float = 0.0
-    scheduler: SchedulerName = "linear"  # Learning rate schedule type
-    warmup_steps: int = 100  # Number of warmup steps for learning rate schedule
-
-    # Copy task specific hyperparameters
-    min_lag: int = 10  # Minimum delay between input sequence and target output
-    max_lag: int = 100  # Maximum delay between input sequence and target output
-    min_copy_length: int = 1  # Minimum length of the sequence to be copied
-    max_copy_length: int = 10  # Maximum length of the sequence to be copied
-    batch_size: int = 32
-    num_classes: int = 10  # Vocabulary size (number of distinct tokens)
-    embed_dim: int = 32  # Embedding dimension for token inputs
-    hidden_dim: int = 128  # Hidden dimension of the RNN
-
-
-class ModelWithEmbedding(BaseSequenceModel):
-    """Wrapper that adds embedding layer for discrete token inputs.
-
-    This class wraps any BaseSequenceModel with an embedding layer to convert discrete
-    token IDs into continuous embeddings before passing them to the model.
-    """
-
-    def __init__(
-        self,
-        base_model: BaseSequenceModel,
-        vocab_size: int,
-        embed_dim: int,
-        config: ModelConfig,
-    ):
-        super().__init__(config)
-        self.vocab_size = vocab_size
-        self.embed_dim = embed_dim
-        self.base_model = base_model
-
-    def initialize(self, key: jax.Array) -> Any:
-        """Initialize model parameters: embedding matrix and RNN weights."""
-        # Split random key for independent initialization of embedding and RNN
-        embedding_key, rnn_key = jax.random.split(key, 2)
-
-        # Initialize embedding matrix: [vocab_size, embed_dim]
-        # Each row represents the embedding vector for a token ID
-        # These are learnable parameters that will be updated during training via backpropagation
-        # Gradients flow through the embedding lookup operation in the forward pass
-        embedding_params = jax.nn.initializers.normal(stddev=0.02)(
-            embedding_key, (self.vocab_size, self.embed_dim), dtype=jnp.float32
-        )
-
-        # Initialize base model parameters
-        base_params = self.base_model.initialize(rnn_key)
-
-        return {"embedding": embedding_params, "model": base_params}
-
-    def apply(
-        self, params: Any, token_ids: jnp.ndarray, mask: jnp.ndarray
-    ) -> jnp.ndarray:
-        """Forward pass: embed tokens and apply RNN.
-
-        Args:
-            params: Model parameters containing 'embedding' and 'rnn' keys
-            token_ids: Token IDs of shape [batch, seq_len]
-            mask: Attention mask of shape [batch, seq_len]
-
-        Returns:
-            RNN outputs of shape [batch, seq_len, output_dim]
-        """
-        # Look up embeddings for each token ID: [batch, seq_len] -> [batch, seq_len, embed_dim]
-        embeddings = params["embedding"][token_ids]
-
-        # Apply base model to embedded sequence
-        return self.base_model.apply(params["model"], embeddings, mask)
-
-
-def create_base_model(
-    model_name: str, model_config: ModelConfig, model_kwargs: Dict[str, Any]
-) -> BaseSequenceModel:
-    """Factory function to create a base model instance.
-
-    Args:
-        model_name: Name of the model to create ("elman_rnn", "lstm", "lru", "transformer")
-        model_config: ModelConfig instance with model hyperparameters
-        model_kwargs: Additional keyword arguments specific to the model type
-
-    Returns:
-        BaseSequenceModel instance
-
-    Raises:
-        ValueError: If model_name is not recognized
-    """
-    if model_name == "elman_rnn":
-        return ElmanRNN(model_config)
-    elif model_name == "lstm":
-        return LSTM(model_config)
-    elif model_name == "lru":
-        return LinearRecurrentUnit(model_config)
-    elif model_name == "transformer":
-        return TransformerAdapter(model_config, **model_kwargs)
-    else:
-        raise ValueError(
-            f"Unknown model_name: {model_name}. "
-            f"Supported options: 'elman_rnn', 'lstm', 'lru', 'transformer'"
-        )
-
-
-def build_optimizer(config: CopyTrainConfig) -> optax.GradientTransformation:
-    """Build optimizer with learning rate schedule.
-
-    Creates a learning rate schedule and wraps it with the specified optimizer.
-    """
-    # Build learning rate schedule based on configuration
-    if config.scheduler == "linear":
-        # Linear warmup from 0 to learning_rate over warmup_steps
-        learning_rate_schedule = optax.linear_schedule(
-            init_value=0.0, end_value=config.lr, transition_steps=config.warmup_steps
-        )
-    elif config.scheduler == "cosine":
-        # Cosine schedule: warmup to peak, then cosine decay to zero
-        learning_rate_schedule = optax.warmup_cosine_decay_schedule(
-            init_value=0.0,
-            peak_value=config.lr,
-            warmup_steps=config.warmup_steps,
-            decay_steps=max(config.steps - config.warmup_steps, 1),
-            end_value=0.0,
-        )
-    else:
-        raise ValueError(f"Unknown scheduler {config.scheduler}")
-
-    # Build optimizer with the learning rate schedule
-    if config.optimizer == "adamw":
-        return optax.adamw(learning_rate_schedule, weight_decay=config.weight_decay)
-    elif config.optimizer == "sgd":
-        # SGD with momentum and Nesterov acceleration
-        return optax.sgd(learning_rate_schedule, momentum=0.9, nesterov=True)
-    elif config.optimizer == "muon":
-        return optax.adamw(learning_rate_schedule, weight_decay=config.weight_decay)
-    else:
-        raise ValueError(f"Unknown optimizer {config.optimizer}")
+# ============================================================================
+# Metric computation utilities
+# ============================================================================
 
 
 def compute_metrics(
@@ -297,106 +103,128 @@ def shift_targets(token_ids: jnp.ndarray, mask: jnp.ndarray):
     return shifted_target_ids, shifted_mask
 
 
-def maybe_cast_precision(array: jnp.ndarray, precision: str) -> jnp.ndarray:
-    """Cast array to specified precision if needed.
-
-    Args:
-        array: Input array
-        precision: Precision string (e.g., "bfloat16")
-
-    Returns:
-        Array cast to specified precision, or original array if precision not recognized
-    """
-    if precision == "bfloat16":
-        return array.astype(jnp.bfloat16)
-    return array
-
-
-def train_copy(config: CopyTrainConfig) -> None:
-    """Train a model on the copy task.
+def train_copy(
+    task_cfg: Dict[str, Any],
+    model_cfg: DictConfig,
+    train_cfg: TrainLoopConfig,
+    optimizer_cfg: OptimizerConfig,
+) -> None:
+    """Train an RNN on the copy task.
 
     The copy task requires the model to remember an input sequence and reproduce
     it after a delay period. This tests the model's ability to maintain information
     in its hidden state over time.
-
-    Supports multiple model types: elman_rnn, lstm, lru, and transformer.
     """
-    # Set run name if not provided
-    if not config.run_name:
-        config.run_name = f"hess_copy_{config.model_name}"
-
-    # Print training configuration
-    print("=" * 80)
-    print(f"Starting training: {config.run_name}")
-    print("=" * 80)
-    print(f"Model: {config.model_name}")
-    print(f"Model kwargs: {config.model_kwargs}")
-    print(f"Steps: {config.steps}")
-    print(f"Batch size: {config.batch_size}")
-    print(f"Learning rate: {config.lr}")
-    print(f"Optimizer: {config.optimizer}")
-    print(f"Scheduler: {config.scheduler}")
-    print(f"Lag range: [{config.min_lag}, {config.max_lag}]")
-    print(f"Copy length range: [{config.min_copy_length}, {config.max_copy_length}]")
-    print(f"Hidden dim: {config.hidden_dim}, Embed dim: {config.embed_dim}")
-    print(f"Checkpointing: save_best={config.save_best}, save_periodic={config.save_periodic_checkpoints}")
-    print("=" * 80)
-
-    # Initialize wandb for experiment tracking
-    wandb.init(project=config.project, name=config.run_name, config=config.__dict__)
-
+    # ========================================================================
+    # Setup: Initialize wandb, dataset, model, optimizer, and checkpointing
+    # ========================================================================
+    run_identifier, hydra_run_dir = initialize_wandb_run(
+        train_cfg, task_cfg, model_cfg, optimizer_cfg
+    )
     # Create dataset generator for the copy task
+    base_min_lag = int(task_cfg["min_lag"])
+    base_max_lag = int(task_cfg["max_lag"])
+    seq_length = int(task_cfg.get("seq_length", 10))
     dataset = CopyDataset(
-        min_lag=config.min_lag,
-        max_lag=config.max_lag,
-        min_copy_length=config.min_copy_length,
-        max_copy_length=config.max_copy_length,
-        batch_size=config.batch_size,
-        num_classes=config.num_classes,
+        min_lag=base_min_lag,
+        max_lag=base_max_lag,
+        batch_size=int(task_cfg["batch_size"]),
+        num_classes=int(task_cfg["num_classes"]),
+        seq_length=seq_length,
     )
+    length_generalization_fractions = tuple(
+        float(value)
+        for value in (train_cfg.length_generalization_fractions or ())
+        if value is not None
+    )
+    noise_generalization_stddevs = tuple(
+        float(value)
+        for value in (train_cfg.noise_generalization_stddevs or ())
+        if value is not None
+    )
+    generalization_rng = jax.random.PRNGKey(train_cfg.seed + 1)
 
-    # Create model configuration
-    # Note: input_dim is set to embed_dim, but the actual input will be token IDs
-    # which get embedded before being passed to the model
-    model_config = ModelConfig(
-        input_dim=config.embed_dim,
-        output_dim=config.num_classes,
-        hidden_dim=config.hidden_dim,
-        precision=config.precision,
-    )
+    # Extract task dimensions and vocabulary size
+    vocab_size = int(task_cfg["num_classes"])
+    num_classes = vocab_size
+    input_dim = int(task_cfg.get("input_dim", vocab_size))
+    output_dim = int(task_cfg.get("output_dim", vocab_size))
+    task_dims = {"input_dim": input_dim, "output_dim": output_dim}
 
-    # Create base model using factory function
-    base_model = create_base_model(
-        config.model_name, model_config, config.model_kwargs
-    )
-
-    # Wrap base model with embedding layer
-    model = ModelWithEmbedding(
-        base_model=base_model,
-        vocab_size=config.num_classes,
-        embed_dim=config.embed_dim,
-        config=model_config,
-    )
+    # Build model and validate precision settings
+    model, model_config = build_model(model_cfg, train_cfg, task_dims)
+    validate_precisions(model_config, train_cfg)
 
     # Build optimizer with learning rate schedule
-    optimizer = build_optimizer(config)
+    optimizer = build_optimizer(optimizer_cfg, train_cfg.steps)
 
     # Initialize model parameters and optimizer state
-    random_key = jax.random.PRNGKey(0)
+    random_key = jax.random.PRNGKey(train_cfg.seed)
     model_params = model.initialize(random_key)
     optimizer_state = optimizer.init(model_params)
 
-    # Set up checkpoint manager if orbax is available
-    checkpoint_manager = None
-    # Build checkpoint directory: checkpoints/{dataset_name}/{architecture_name}
+    # Print model information including parameter count
+    param_count = model.parameter_count(model_params)
+    param_count_millions = param_count / 1_000_000
+    model_name = model.__class__.__name__
+    print(f"\nModel: {model_name}")
+    print(f"Total parameters: {param_count_millions:.1f}M ({param_count:,})")
+    print("-" * 80)
+
+    # Configure feature logging (for models that support analyze_batch)
+    supports_feature_logging = hasattr(model, "analyze_batch")
+    feature_log_every = int(getattr(train_cfg, "feature_log_every", 0) or 0)
+    feature_log_batches = max(1, int(getattr(train_cfg, "feature_log_max_batches", 1)))
+    feature_save_dir = train_cfg.feature_save_dir
+    if feature_save_dir:
+        os.makedirs(feature_save_dir, exist_ok=True)
+
+    # Track metrics and timing for logging
+    last_feature_metrics: Dict[str, float] | None = None
+    last_eval_metrics: Dict[str, float] | None = None
+    last_generalization_metrics: Dict[str, float] | None = None
+    start_time = time.time()
+
+    # Setup checkpointing and artifact directories
     dataset_name = "copy"
-    architecture_name = f"{config.model_name}_with_embedding"
-    checkpoint_directory = os.path.abspath(
-        os.path.join("checkpoints", dataset_name, architecture_name)
+    architecture_name = re.sub(
+        r"(?<!^)(?=[A-Z])", "_", model.__class__.__name__
+    ).lower()
+    checkpoint_manager = create_checkpoint_manager(
+        train_cfg, dataset_name, architecture_name
     )
-    checkpoint_manager = ocp.CheckpointManager(
-        checkpoint_directory, ocp.PyTreeCheckpointer()
+    prediction_plot_dir, jacobian_plot_dir = ensure_prediction_artifacts(
+        train_cfg, hydra_run_dir, dataset_name, architecture_name, run_identifier
     )
+    jacobian_eval_history: List[Dict[str, Any]] = []
+
+    # ========================================================================
+    # Helper functions: Input embedding and training/evaluation steps
+    # ========================================================================
+
+    def embed_inputs(token_ids: jnp.ndarray) -> jnp.ndarray:
+        embedded = jax.nn.one_hot(token_ids, input_dim, dtype=jnp.float32)
+        return maybe_cast_precision(embedded, train_cfg.precision)
+
+    def evaluate_with_noise(
+        params_to_eval,
+        inputs: jnp.ndarray,
+        targets: jnp.ndarray,
+        mask: jnp.ndarray,
+        noise_std: float = 0.0,
+        rng_key: jax.Array | None = None,
+    ) -> Dict[str, jnp.ndarray]:
+        shifted_target_ids, shifted_target_mask = shift_targets(targets, mask)
+        embedded_inputs = embed_inputs(inputs)
+        if noise_std and noise_std > 0.0:
+            if rng_key is None:
+                rng_key = jax.random.PRNGKey(0)
+            noise = noise_std * jax.random.normal(
+                rng_key, embedded_inputs.shape, dtype=embedded_inputs.dtype
+            )
+            embedded_inputs = embedded_inputs + noise
+        logits = model.apply(params_to_eval, embedded_inputs, mask)
+        return compute_metrics(logits, shifted_target_ids, shifted_target_mask)
 
     @jax.jit
     def train_step(model_params, optimizer_state, inputs, targets, mask):
@@ -410,8 +238,10 @@ def train_copy(config: CopyTrainConfig) -> None:
 
         def loss_fn(current_params):
             """Compute loss and metrics for current parameters."""
+            embedded_inputs = embed_inputs(inputs)
+
             # Forward pass: get logits for all positions
-            logits = model.apply(current_params, inputs, mask)
+            logits = model.apply(current_params, embedded_inputs, mask)
 
             # Compute metrics (NLL and accuracy)
             metrics = compute_metrics(logits, shifted_target_ids, shifted_target_mask)
@@ -420,7 +250,7 @@ def train_copy(config: CopyTrainConfig) -> None:
             return metrics["nll"], metrics
 
         # Compute gradients and loss value simultaneously
-        (negative_log_likelihood, metrics), gradients = jax.value_and_grad(
+        (_, metrics), gradients = jax.value_and_grad(
             loss_fn, has_aux=True
         )(model_params)
 
@@ -440,18 +270,75 @@ def train_copy(config: CopyTrainConfig) -> None:
         # Shift targets for next-token prediction
         shifted_target_ids, shifted_target_mask = shift_targets(targets, mask)
 
+        embedded_inputs = embed_inputs(inputs)
+
         # Forward pass: get predictions
-        logits = model.apply(model_params, inputs, mask)
+        logits = model.apply(model_params, embedded_inputs, mask)
 
         # Compute metrics
         metrics = compute_metrics(logits, shifted_target_ids, shifted_target_mask)
 
         return metrics
 
+    def run_length_generalization(step_index: int, params_for_eval) -> Dict[str, float]:
+        logged_metrics: Dict[str, float] = {}
+        if not length_generalization_fractions:
+            return logged_metrics
+        for factor in length_generalization_fractions:
+            if factor is None or factor <= 1.0:
+                continue
+            extended_min = max(1, int(math.ceil(base_min_lag * factor)))
+            extended_max = max(extended_min, int(math.ceil(base_max_lag * factor)))
+            extended_dataset = CopyDataset(
+                min_lag=extended_min,
+                max_lag=extended_max,
+                batch_size=int(task_cfg["batch_size"]),
+                num_classes=int(task_cfg["num_classes"]),
+                seq_length=seq_length,
+            )
+            inputs, targets, mask = extended_dataset()
+            metrics = evaluate_with_noise(params_for_eval, inputs, targets, mask, 0.0)
+            log_prefix = f"features/generalization/length_x{factor:.2f}"
+            payload = {
+                "step": step_index,
+                f"{log_prefix}/nll": float(metrics["nll"]),
+                f"{log_prefix}/accuracy": float(metrics["accuracy"]),
+            }
+            logged_metrics.update({k: v for k, v in payload.items() if k != "step"})
+            wandb.log(payload)
+        return logged_metrics
+
+    def run_noise_generalization(step_index: int, params_for_eval) -> Dict[str, float]:
+        logged_metrics: Dict[str, float] = {}
+        if not noise_generalization_stddevs:
+            return logged_metrics
+        nonlocal generalization_rng
+        for std in noise_generalization_stddevs:
+            if std is None or std < 0.0:
+                continue
+            generalization_rng, noise_key = jax.random.split(generalization_rng)
+            inputs, targets, mask = dataset()
+            metrics = evaluate_with_noise(
+                params_for_eval, inputs, targets, mask, float(std), noise_key
+            )
+            log_prefix = f"features/generalization/noise_{float(std):.3f}"
+            payload = {
+                "step": step_index,
+                f"{log_prefix}/nll": float(metrics["nll"]),
+                f"{log_prefix}/accuracy": float(metrics["accuracy"]),
+            }
+            logged_metrics.update({k: v for k, v in payload.items() if k != "step"})
+            wandb.log(payload)
+        return logged_metrics
+
+    # ========================================================================
+    # Checkpointing: Save best model based on evaluation metric
+    # ========================================================================
+
     # Track best metric value for checkpointing
     best_metric_value = None
     # Determine if higher is better (accuracy) or lower is better (NLL)
-    higher_is_better = config.ckpt_metric.lower() == "accuracy"
+    higher_is_better = train_cfg.ckpt_metric.lower() == "accuracy"
 
     def maybe_save_best(
         step_index: int, metrics: Dict[str, Any], model_params, optimizer_state
@@ -461,7 +348,7 @@ def train_copy(config: CopyTrainConfig) -> None:
         Compares current metric value to best seen value and saves if improved.
         For accuracy, higher is better; for NLL, lower is better.
         """
-        current_metric_value = float(metrics[config.ckpt_metric])
+        current_metric_value = float(metrics[train_cfg.ckpt_metric])
         nonlocal best_metric_value
 
         # Check if this is an improvement
@@ -478,10 +365,15 @@ def train_copy(config: CopyTrainConfig) -> None:
             best_metric_value = current_metric_value
 
             # Log best metric to wandb summary
-            wandb.run.summary["best_" + config.ckpt_metric] = current_metric_value
+            wandb.run.summary["best_" + train_cfg.ckpt_metric] = current_metric_value
 
-            # Save checkpoint if checkpointing is enabled
-            if config.save_best and checkpoint_manager is not None:
+            # Save checkpoint if checkpointing is enabled and not a sweep run
+            if (
+                train_cfg.save_best
+                and not train_cfg.disable_checkpointing
+                and not train_cfg.sweep_run
+                and checkpoint_manager is not None
+            ):
                 checkpoint_manager.save(
                     step_index,
                     args=ocp.args.PyTreeSave(
@@ -493,8 +385,307 @@ def train_copy(config: CopyTrainConfig) -> None:
                     ),
                 )
 
-    # Main training loop
-    for step_index in range(1, config.steps + 1):
+    # ========================================================================
+    # Feature logging: Extract and log internal model statistics
+    # ========================================================================
+
+    def maybe_log_features(
+        step_index: int,
+        model_params,
+        input_ids: jnp.ndarray,
+        mask: jnp.ndarray,
+    ):
+        # Early returns: skip if sweep run, not scheduled, or model doesn't support it
+        if train_cfg.sweep_run:
+            return None
+        if feature_log_every <= 0 or (step_index % feature_log_every) != 0:
+            return None
+        if not supports_feature_logging:
+            return None
+
+        # Initialize accumulators for aggregating statistics across batches
+        mask_total = 0.0
+        frob_sum = 0.0
+        active_sum = 0.0
+        scaling_sum = 0.0
+        scaling_count = 0.0
+        lambda_max_value = None
+        sigma_max_value = None
+        payload_to_save = None
+
+        # Process batches to extract internal model statistics
+        def process(ids, mask_arr):
+            embedded = embed_inputs(ids)
+            _, tensors, stats = model.analyze_batch(model_params, embedded, mask_arr)
+            return tensors, stats
+
+        # Aggregate statistics across multiple batches for more stable estimates
+        for idx in range(feature_log_batches):
+            if idx == 0:
+                ids = input_ids
+                mask_arr = mask
+            else:
+                ids, _, mask_arr = dataset()
+            tensors, stats = process(ids, mask_arr)
+            mask_arr = mask_arr.astype(jnp.float32)
+            mask_total += float(jnp.sum(mask_arr))
+            frob_sum += float(jnp.sum(stats.frobenius_norms * mask_arr))
+            active_sum += float(jnp.sum(stats.nonlinearity_active_fraction))
+            scaling_sum += float(jnp.sum(stats.nonlinearity_scaling))
+            scaling_count += float(
+                jnp.sum(mask_arr) * stats.nonlinearity_scaling.shape[-1]
+            )
+            if lambda_max_value is None:
+                lambda_max_value = float(stats.max_eigenvalue)
+            if sigma_max_value is None:
+                sigma_max_value = float(stats.max_singular_value)
+            if payload_to_save is None and feature_save_dir:
+                payload = {
+                    "frobenius_norms": stats.frobenius_norms,
+                    "active_fraction": stats.nonlinearity_active_fraction,
+                    "scaling": stats.nonlinearity_scaling,
+                }
+                if hasattr(tensors, "pre_activations"):
+                    payload["pre_activations"] = tensors.pre_activations
+                if hasattr(tensors, "candidate_pre_activations"):
+                    payload["candidate_pre_activations"] = (
+                        tensors.candidate_pre_activations
+                    )
+                if hasattr(tensors, "hidden_states"):
+                    payload["hidden_states"] = tensors.hidden_states
+                payload["lambda_max"] = stats.max_eigenvalue
+                payload["max_singular_value"] = stats.max_singular_value
+                payload_to_save = payload
+
+        if mask_total <= 0:
+            return None
+        # Compute averaged metrics from accumulated statistics
+        eps = 1e-6
+        feature_metrics = {
+            "features/frobenius_mean": frob_sum / (mask_total + eps),
+            "features/nonlinearity_active_fraction": active_sum / (mask_total + eps),
+            "features/nonlinearity_scale_mean": scaling_sum / (scaling_count + eps),
+        }
+        if lambda_max_value is not None:
+            feature_metrics["features/lambda_max"] = lambda_max_value
+        if sigma_max_value is not None:
+            feature_metrics["features/max_singular_value"] = sigma_max_value
+        wandb.log({"step": step_index, **feature_metrics})
+        if payload_to_save is not None:
+            save_path = os.path.join(feature_save_dir, f"step_{step_index:06d}.npz")
+            payload_np = jax.device_get(payload_to_save)
+            np.savez(save_path, **payload_np)
+        return feature_metrics
+
+    # ========================================================================
+    # Visualization: Create plots for predictions and Jacobian analysis
+    # ========================================================================
+
+    def create_prediction_figure(
+        model_params,
+        input_ids: jnp.ndarray,
+        target_ids: jnp.ndarray,
+        attention_mask: jnp.ndarray,
+        example_idx: int = 0,
+    ):
+        # Generate predictions for visualization
+        embedded_inputs = embed_inputs(input_ids)
+        logits = model.apply(model_params, embedded_inputs, attention_mask)
+        predictions = jnp.argmax(logits, axis=-1)
+
+        # Convert JAX arrays to numpy for plotting
+        inputs_np = np.asarray(jax.device_get(input_ids))
+        targets_np = np.asarray(jax.device_get(target_ids))
+        preds_np = np.asarray(jax.device_get(predictions))
+        mask_np = np.asarray(jax.device_get(attention_mask)).astype(bool)
+
+        # Extract single example for visualization
+        example_idx = int(np.clip(example_idx, 0, inputs_np.shape[0] - 1))
+        inp = inputs_np[example_idx]
+        tgt = targets_np[example_idx]
+        pred = preds_np[example_idx]
+        valid = mask_np[example_idx]
+
+        # Create 4-panel figure: input, target, prediction, mask
+        fig, axes = plt.subplots(4, 1, figsize=(14, 8), sharex=True)
+        axes[0].imshow(
+            inp[None, :], aspect="auto", cmap="tab20", vmin=0, vmax=num_classes
+        )
+        axes[0].set_ylabel("input")
+        axes[1].imshow(
+            tgt[None, :], aspect="auto", cmap="tab20", vmin=0, vmax=num_classes
+        )
+        axes[1].set_ylabel("target")
+        axes[2].imshow(
+            pred[None, :], aspect="auto", cmap="tab20", vmin=0, vmax=num_classes
+        )
+        axes[2].set_ylabel("pred")
+        axes[3].imshow(
+            valid[None, :].astype(float), aspect="auto", cmap="gray", vmin=0, vmax=1
+        )
+        axes[3].set_ylabel("mask")
+        for ax in axes:
+            ax.set_yticks([])
+            ax.set_xlim(0, len(inp))
+        axes[3].set_xlabel("time step")
+        plt.tight_layout()
+
+        valid_count = np.maximum(valid.sum(), 1)
+        diff = (pred != tgt) & valid
+        sequence_accuracy = 1.0 - (diff.sum() / valid_count)
+        return fig, float(sequence_accuracy)
+
+    def log_prediction_figure(
+        step_index: int,
+        model_params,
+        input_ids: jnp.ndarray,
+        target_ids: jnp.ndarray,
+        attention_mask: jnp.ndarray,
+    ):
+        try:
+            fig, sequence_accuracy = create_prediction_figure(
+                model_params, input_ids, target_ids, attention_mask
+            )
+        except Exception:
+            logging.exception("Failed to create prediction visualization.")
+            return
+
+        caption = f"Step {step_index} - Sequence accuracy {sequence_accuracy:.3f}"
+        try:
+            wandb.run.summary["prediction_plot"] = wandb.Image(fig, caption=caption)
+        except Exception:
+            logging.exception(
+                "Failed to log prediction visualization to wandb summary."
+            )
+        figure_path = os.path.join(
+            prediction_plot_dir, f"prediction_step_{step_index:06d}.png"
+        )
+        fig.savefig(figure_path)
+        plt.close(fig)
+
+    # Compute Jacobian statistics (Frobenius norms) across time steps
+    def compute_jacobian_stats(
+        model_params,
+        input_ids: jnp.ndarray,
+        attention_mask: jnp.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        embedded = embed_inputs(input_ids)
+        full_mask = jnp.ones_like(attention_mask)
+        _, tensors, stats = model.analyze_batch(model_params, embedded, full_mask)
+        frob = np.asarray(jax.device_get(stats.frobenius_norms))
+        if frob.ndim != 2:
+            raise ValueError("Expected frobenius norms with shape [B, T].")
+        mean = np.mean(frob, axis=0)
+        std = np.std(frob, axis=0)
+        time_points = np.arange(frob.shape[1])
+        return time_points, mean, std
+
+    def log_jacobian_figure(
+        step_index: int,
+        model_params,
+        input_ids: jnp.ndarray,
+        attention_mask: jnp.ndarray,
+    ):
+        if not supports_feature_logging:
+            return
+        try:
+            time_points, mean, std = compute_jacobian_stats(
+                model_params, input_ids, attention_mask
+            )
+        except Exception:
+            logging.exception("Failed to compute jacobian statistics.")
+            return
+
+        jacobian_eval_history.append(
+            {
+                "step": int(step_index),
+                "time": time_points.tolist(),
+                "mean": mean.tolist(),
+                "std": std.tolist(),
+            }
+        )
+        mean = np.array(mean, dtype=np.float32)
+        std = np.array(std, dtype=np.float32)
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.plot(time_points, mean, label=f"Step {step_index}")
+        ax.fill_between(time_points, mean - std, mean + std, alpha=0.3)
+        ax.set_title("Jacobian Frobenius Norm Across Sequence")
+        ax.set_xlabel("Time step")
+        ax.set_ylabel("Frobenius norm")
+        ax.legend(loc="upper right")
+        ax.set_yscale("log")
+        upper = float(np.max(mean + std) + 1e-6)
+        lower = float(np.min(np.maximum(mean - std, 1e-8)))
+        lower = max(lower, 1e-8)
+        ax.set_ylim(lower, upper)
+        ax.grid(True, linestyle="--", alpha=0.3)
+        fig.tight_layout()
+
+        figure_path = os.path.join(
+            jacobian_plot_dir, f"jacobian_step_{step_index:06d}.png"
+        )
+        fig.savefig(figure_path)
+        try:
+            wandb.log(
+                {
+                    "step": step_index,
+                    "eval/jacobian_plot": wandb.Image(
+                        fig, caption=f"Jacobian norms at step {step_index}"
+                    ),
+                }
+            )
+        except Exception:
+            logging.exception("Failed to log jacobian plot to wandb.")
+        plt.close(fig)
+
+    def log_final_jacobian_summary():
+        if not jacobian_eval_history:
+            return
+        summary_path = os.path.join(jacobian_plot_dir, "jacobian_eval_history.json")
+        with open(summary_path, "w", encoding="utf-8") as fp:
+            json.dump(jacobian_eval_history, fp, indent=2)
+
+        steps = np.array([entry["step"] for entry in jacobian_eval_history])
+        all_time = np.array(jacobian_eval_history[0]["time"])
+        cmap = plt.colormaps.get_cmap("viridis")
+        norm = plt.Normalize(vmin=steps.min(), vmax=steps.max())
+
+        fig, ax = plt.subplots(figsize=(10, 5))
+        for entry in jacobian_eval_history:
+            color = cmap(norm(entry["step"]))
+            ax.plot(
+                all_time,
+                entry["mean"],
+                color=color,
+                alpha=0.9,
+                label=f"step {entry['step']}",
+            )
+        ax.set_title("Jacobian Frobenius Norm Trajectories")
+        ax.set_xlabel("Time step")
+        ax.set_ylabel("Frobenius norm (mean)")
+        sm = matplotlib.cm.ScalarMappable(cmap=cmap, norm=norm)
+        sm.set_array([])
+        fig.colorbar(sm, ax=ax, label="Training step")
+        if len(jacobian_eval_history) <= 10:
+            ax.legend(loc="upper right", fontsize="small")
+        ax.grid(True, linestyle="--", alpha=0.3)
+        fig.tight_layout()
+
+        summary_figure_path = os.path.join(jacobian_plot_dir, "jacobian_summary.png")
+        fig.savefig(summary_figure_path)
+        try:
+            wandb.run.summary["jacobian_summary_plot"] = wandb.Image(
+                fig, caption="Jacobian Frobenius trajectories"
+            )
+        except Exception:
+            logging.exception("Failed to log jacobian summary to wandb.")
+        plt.close(fig)
+
+    # ========================================================================
+    # Main training loop: Iterate over training steps
+    # ========================================================================
+
+    for step_index in range(1, train_cfg.steps + 1):
         # Get a batch of training data (now includes mask)
         input_sequence, target_sequence, attention_mask = dataset()
 
@@ -508,41 +699,90 @@ def train_copy(config: CopyTrainConfig) -> None:
         )
 
         # Log training metrics periodically
-        if step_index % config.log_every == 0:
-            nll = float(training_metrics["nll"])
-            acc = float(training_metrics["accuracy"])
-            progress_pct = 100.0 * step_index / config.steps
-            print(
-                f"Step {step_index:5d}/{config.steps} ({progress_pct:5.1f}%) | "
-                f"Train NLL: {nll:.4f} | Train Acc: {acc:.4f}"
-            )
+        if step_index % train_cfg.log_every == 0:
+            train_stats = {
+                metric_name: float(metric_value)
+                for metric_name, metric_value in training_metrics.items()
+            }
             wandb.log(
                 {
                     "step": step_index,
-                    **{
-                        metric_name: float(metric_value)
-                        for metric_name, metric_value in training_metrics.items()
-                    },
+                    **train_stats,
                 }
             )
+            feature_stats = maybe_log_features(
+                step_index, model_params, input_sequence, attention_mask
+            )
+            if feature_stats is not None:
+                last_feature_metrics = feature_stats
 
-        # Run evaluation periodically
-        if step_index % config.eval_every == 0:
+            elapsed = time.time() - start_time
+            speed = elapsed / step_index
+            eta = (train_cfg.steps - step_index) * speed
+            print(
+                f"\nStep {step_index}/{train_cfg.steps}  ({format_hms(elapsed)} elapsed, {format_hms(eta)} ETA)"
+            )
+            print(
+                "  train ┆ "
+                + " │ ".join(
+                    f"{name}: {value:.4f}" for name, value in train_stats.items()
+                )
+            )
+            if last_eval_metrics:
+                print(
+                    "  eval  ┆ "
+                    + " │ ".join(
+                        f"{name}: {value:.4f}"
+                        for name, value in last_eval_metrics.items()
+                    )
+                )
+            if last_feature_metrics:
+                print(
+                    "  feat  ┆ "
+                    + " │ ".join(
+                        f"{name.split('/')[-1]}: {value:.4f}"
+                        for name, value in last_feature_metrics.items()
+                    )
+                )
+            if last_generalization_metrics:
+                print(
+                    "  gen  ┆ "
+                    + " │ ".join(
+                        f"{name}: {value:.4f}"
+                        for name, value in last_generalization_metrics.items()
+                    )
+                )
+            print("-" * 80)
+        else:
+            maybe_log_features(step_index, model_params, input_sequence, attention_mask)
+
+        # ====================================================================
+        # Evaluation: Compute metrics on validation batches
+        # ====================================================================
+        if step_index % train_cfg.eval_every == 0:
             # Aggregate metrics over multiple evaluation batches for more stable estimates
             aggregated_eval_metrics = {"nll": 0.0, "accuracy": 0.0}
+            # Store first batch for visualization purposes
+            prediction_batch: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray] | None = None
+            jacobian_batch: tuple[jnp.ndarray, jnp.ndarray] | None = None
 
-            for _ in range(config.eval_steps):
+            # Evaluate on multiple batches and average results
+            for _ in range(train_cfg.eval_steps):
                 eval_inputs, eval_targets, eval_mask = dataset()
+                if prediction_batch is None:
+                    prediction_batch = (eval_inputs, eval_targets, eval_mask)
+                if jacobian_batch is None:
+                    jacobian_batch = (eval_inputs, eval_mask)
                 eval_metrics = eval_step(
                     model_params, eval_inputs, eval_targets, eval_mask
                 )
 
                 # Accumulate metrics (averaging will happen by dividing by eval_steps)
                 aggregated_eval_metrics["nll"] += (
-                    float(eval_metrics["nll"]) / config.eval_steps
+                    float(eval_metrics["nll"]) / train_cfg.eval_steps
                 )
                 aggregated_eval_metrics["accuracy"] += (
-                    float(eval_metrics["accuracy"]) / config.eval_steps
+                    float(eval_metrics["accuracy"]) / train_cfg.eval_steps
                 )
 
             # Log evaluation metrics
@@ -563,18 +803,43 @@ def train_copy(config: CopyTrainConfig) -> None:
 
             # Check if this is the best model and save if so
             metrics_for_checkpoint = {
-                config.ckpt_metric: aggregated_eval_metrics[config.ckpt_metric]
+                train_cfg.ckpt_metric: aggregated_eval_metrics[train_cfg.ckpt_metric]
             }
             maybe_save_best(
                 step_index, metrics_for_checkpoint, model_params, optimizer_state
             )
-            if best_metric_value is not None:
-                print(f"  -> Best {config.ckpt_metric}: {best_metric_value:.4f}")
+            if not train_cfg.sweep_run:
+                save_weight_checkpoint(
+                    model,
+                    model_params,
+                    train_cfg,
+                    dataset_name,
+                    architecture_name,
+                    step_index,
+                    lr=optimizer_cfg.lr,
+                    weight_decay=optimizer_cfg.weight_decay,
+                )
+            last_eval_metrics = {
+                "eval/nll": aggregated_eval_metrics["nll"],
+                "eval/accuracy": aggregated_eval_metrics["accuracy"],
+            }
+            generalization_metrics: Dict[str, float] = {}
+            generalization_metrics.update(
+                run_length_generalization(step_index, model_params)
+            )
+            generalization_metrics.update(
+                run_noise_generalization(step_index, model_params)
+            )
+            if generalization_metrics:
+                last_generalization_metrics = generalization_metrics
+            if jacobian_batch is not None and not train_cfg.sweep_run:
+                log_jacobian_figure(step_index, model_params, *jacobian_batch)
 
-        # Save periodic checkpoints if enabled
+        # Save periodic checkpoints (not just best model)
         if (
-            config.save_periodic_checkpoints
-            and step_index % config.ckpt_every == 0
+            step_index % train_cfg.ckpt_every == 0
+            and not train_cfg.disable_checkpointing
+            and not train_cfg.sweep_run
             and checkpoint_manager is not None
         ):
             checkpoint_manager.save(
@@ -583,7 +848,33 @@ def train_copy(config: CopyTrainConfig) -> None:
                     {"params": model_params, "opt_state": optimizer_state}
                 ),
             )
-            print(f"Step {step_index:5d}/{config.steps} | Saved periodic checkpoint")
+
+
+    # ========================================================================
+    # Finalization: Generate final visualizations and summaries
+    # ========================================================================
+
+    if not train_cfg.sweep_run:
+        final_inputs, final_targets, final_mask = dataset()
+        log_prediction_figure(
+            train_cfg.steps, model_params, final_inputs, final_targets, final_mask
+        )
+        if supports_feature_logging:
+            log_jacobian_figure(train_cfg.steps, model_params, final_inputs, final_mask)
+        log_final_jacobian_summary()
+
+    # ========================================================================
+    # Finalization: Generate final visualizations and summaries
+    # ========================================================================
+
+    if not train_cfg.sweep_run:
+        final_inputs, final_targets, final_mask = dataset()
+        log_prediction_figure(
+            train_cfg.steps, model_params, final_inputs, final_targets, final_mask
+        )
+        if supports_feature_logging:
+            log_jacobian_figure(train_cfg.steps, model_params, final_inputs, final_mask)
+        log_final_jacobian_summary()
 
     # Finalize wandb run
     print("=" * 80)
@@ -594,243 +885,22 @@ def train_copy(config: CopyTrainConfig) -> None:
     wandb.finish()
 
 
-def parse_args() -> argparse.Namespace:
-    """Parse command line arguments with defaults matching CopyTrainConfig."""
-    parser = argparse.ArgumentParser(
-        description="Train a model on the copy task",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-
-    # Wandb logging configuration
-    parser.add_argument(
-        "--project",
-        type=str,
-        default="recurrent_networks_copy",
-        help="Wandb project name",
-    )
-    parser.add_argument(
-        "--run_name",
-        type=str,
-        default="",
-        help="Wandb run name (will be set to hess_copy_{model_name} if empty)",
-    )
-
-    # Model configuration
-    parser.add_argument(
-        "--model_name",
-        type=str,
-        default="elman_rnn",
-        choices=["elman_rnn", "lstm", "lru", "transformer"],
-        help="Model type to train",
-    )
-    parser.add_argument(
-        "--model_kwargs",
-        type=str,
-        default="{}",
-        help="Additional model kwargs as JSON string (e.g., '{\"num_heads\": 4}')",
-    )
-
-    # Training loop configuration
-    parser.add_argument(
-        "--steps",
-        type=int,
-        default=5000,
-        help="Total number of training steps",
-    )
-    parser.add_argument(
-        "--log_every",
-        type=int,
-        default=None,
-        help="Log training metrics every N steps (default: steps // 100)",
-    )
-    parser.add_argument(
-        "--eval_every",
-        type=int,
-        default=None,
-        help="Run evaluation every N steps (default: steps // 10)",
-    )
-    parser.add_argument(
-        "--eval_steps",
-        type=int,
-        default=None,
-        help="Number of batches to evaluate over (default: steps // 5)",
-    )
-
-    # Checkpointing configuration
-    parser.add_argument(
-        "--ckpt_every",
-        type=int,
-        default=None,
-        help="Save checkpoint every N steps (default: steps // 20)",
-    )
-    parser.add_argument(
-        "--ckpt_metric",
-        type=str,
-        default="accuracy",
-        choices=["accuracy", "nll"],
-        help="Metric to track for best model",
-    )
-    parser.add_argument(
-        "--no_save_best",
-        dest="save_best",
-        action="store_false",
-        default=True,
-        help="Disable saving best model (default: save_best=True)",
-    )
-    parser.add_argument(
-        "--save_periodic_checkpoints",
-        action="store_true",
-        default=False,
-        help="Whether to save periodic checkpoints (in addition to best model)",
-    )
-
-    # Model precision
-    parser.add_argument(
-        "--precision",
-        type=str,
-        default="bfloat16",
-        help="Model precision",
-    )
-
-    # Optimizer configuration
-    parser.add_argument(
-        "--optimizer",
-        type=str,
-        default="adamw",
-        choices=["adamw", "sgd", "muon"],
-        help="Optimizer type",
-    )
-    parser.add_argument(
-        "--lr",
-        type=float,
-        default=1e-3,
-        help="Learning rate",
-    )
-    parser.add_argument(
-        "--weight_decay",
-        type=float,
-        default=0.0,
-        help="Weight decay coefficient",
-    )
-    parser.add_argument(
-        "--scheduler",
-        type=str,
-        default="linear",
-        choices=["linear", "cosine"],
-        help="Learning rate schedule type",
-    )
-    parser.add_argument(
-        "--warmup_steps",
-        type=int,
-        default=100,
-        help="Number of warmup steps for learning rate schedule",
-    )
-
-    # Copy task specific hyperparameters
-    parser.add_argument(
-        "--min_lag",
-        type=int,
-        default=10,
-        help="Minimum delay between input sequence and target output",
-    )
-    parser.add_argument(
-        "--max_lag",
-        type=int,
-        default=100,
-        help="Maximum delay between input sequence and target output",
-    )
-    parser.add_argument(
-        "--min_copy_length",
-        type=int,
-        default=1,
-        help="Minimum length of the sequence to be copied",
-    )
-    parser.add_argument(
-        "--max_copy_length",
-        type=int,
-        default=10,
-        help="Maximum length of the sequence to be copied",
-    )
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=32,
-        help="Batch size",
-    )
-    parser.add_argument(
-        "--num_classes",
-        type=int,
-        default=10,
-        help="Vocabulary size (number of distinct tokens)",
-    )
-    parser.add_argument(
-        "--embed_dim",
-        type=int,
-        default=32,
-        help="Embedding dimension for token inputs",
-    )
-    parser.add_argument(
-        "--hidden_dim",
-        type=int,
-        default=128,
-        help="Hidden dimension of the RNN",
-    )
-
-    args = parser.parse_args()
-
-    # Parse model_kwargs JSON string
-    try:
-        args.model_kwargs = json.loads(args.model_kwargs)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Invalid JSON in --model_kwargs: {e}")
-
-    # Set computed defaults if not provided
-    if args.log_every is None:
-        args.log_every = args.steps // 100
-    if args.eval_every is None:
-        args.eval_every = args.steps // 10
-    if args.eval_steps is None:
-        args.eval_steps = args.steps // 5
-    if args.ckpt_every is None:
-        args.ckpt_every = args.steps // 20
-
-    return args
+# ============================================================================
+# Entry point: Hydra configuration and training invocation
+# ============================================================================
 
 
-def args_to_config(args: argparse.Namespace) -> CopyTrainConfig:
-    """Convert parsed arguments to CopyTrainConfig."""
-    return CopyTrainConfig(
-        project=args.project,
-        run_name=args.run_name,
-        model_name=args.model_name,
-        model_kwargs=args.model_kwargs,
-        steps=args.steps,
-        log_every=args.log_every,
-        eval_every=args.eval_every,
-        eval_steps=args.eval_steps,
-        ckpt_every=args.ckpt_every,
-        ckpt_metric=args.ckpt_metric,
-        save_best=args.save_best,
-        save_periodic_checkpoints=args.save_periodic_checkpoints,
-        precision=args.precision,
-        optimizer=args.optimizer,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        scheduler=args.scheduler,
-        warmup_steps=args.warmup_steps,
-        min_lag=args.min_lag,
-        max_lag=args.max_lag,
-        min_copy_length=args.min_copy_length,
-        max_copy_length=args.max_copy_length,
-        batch_size=args.batch_size,
-        num_classes=args.num_classes,
-        embed_dim=args.embed_dim,
-        hidden_dim=args.hidden_dim,
+@hydra.main(version_base=None, config_path="../configs", config_name="copy")
+def main(cfg: DictConfig) -> None:
+    train_cfg = TrainLoopConfig(**OmegaConf.to_container(cfg.train, resolve=True))
+    optimizer_cfg = OptimizerConfig(
+        **OmegaConf.to_container(cfg.optimizer, resolve=True)
     )
+    task_cfg = OmegaConf.to_container(cfg.task, resolve=True)
+    if not isinstance(task_cfg, dict):
+        raise ValueError("Task config must be a mapping.")
+    train_copy(task_cfg, cfg.model, train_cfg, optimizer_cfg)
 
 
 if __name__ == "__main__":
-    # Parse command line arguments and start training
-    args = parse_args()
-    training_config = args_to_config(args)
-    train_copy(training_config)
+    main()

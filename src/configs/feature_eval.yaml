@@ -1,0 +1,14 @@
+defaults:
+  - task: copy
+  - model: rnn
+  - train: copy_default
+  - eval: feature_default
+  - _self_
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: .
+  output_subdir: null
+

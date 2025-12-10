@@ -1,0 +1,7 @@
+name: muon
+lr: 0.001
+weight_decay: 0.01
+scheduler: linear
+warmup_steps: 500
+use_modula_optim: true
+

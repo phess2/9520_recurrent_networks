@@ -22,9 +22,11 @@ dependencies:
   - rich
   - click
   - pip:
-      # JAX CUDA 12 wheels; rely on pip wheels with bundled CUDA libs (need recent NVIDIA driver)
-      - --find-links https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
-      - "jax[cuda12]"
+      # For CUDA (Linux/Windows, with NVIDIA GPU):
+      # - --find-links https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+      # - "jax[cuda12]"
+      # For Mac (Apple Silicon/Intel, no CUDA):
+      - jax  # Uncomment and comment out the 2 lines above for Mac/CPU-only
       # Core ecosystem
       - optax
       - chex
@@ -41,7 +43,6 @@ dependencies:
       - numpyro
       - distrax
       - hydra-core
-      - hydra-submitit-launcher
 
 # Notes:
 # - Do NOT install cudatoolkit via conda when using JAX CUDA pip wheels; it can conflict.

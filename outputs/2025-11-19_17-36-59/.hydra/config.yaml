@@ -1,0 +1,38 @@
+task:
+  kind: copy
+  min_lag: 10
+  max_lag: 20
+  batch_size: 32
+  num_classes: 10
+  seq_length: 10
+model:
+  architecture: lru
+  hidden_dim: 128
+  num_layers: 1
+  precision: ${train.precision}
+  param_dtype: ${train.precision}
+  mlp_hidden_dim: 64
+optimizer:
+  name: adamw
+  lr: 0.001
+  weight_decay: 0.001
+  scheduler: cosine
+  warmup_steps: 1
+  use_modula_optim: true
+train:
+  project: recurrent_networks_copy
+  run_name: copy_task
+  steps: 5000
+  log_every: 50
+  eval_every: 100
+  eval_steps: 10
+  ckpt_every: 100
+  ckpt_metric: accuracy
+  save_best: true
+  precision: bfloat16
+  entity: phess2-massac
+  seed: 0
+  wandb_api_key: 172a4c57ff0779bfbe96de3da444e9851729e3d9
+  feature_log_every: 500
+  feature_log_max_batches: 1
+  feature_save_dir: feature_logs/copy_default

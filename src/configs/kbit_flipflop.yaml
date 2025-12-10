@@ -1,0 +1,25 @@
+defaults:
+  - task: kbit_flipflop
+  - model: rnn
+  - optimizer: adamw
+  - train: kbit_default
+  # - override hydra/launcher: submitit_slurm
+  - _self_
+
+# hydra:
+#   job:
+#     chdir: true
+#   run:
+#     dir: outputs/${now:%Y-%m-%d_%H-%M-%S}
+#   sweep:
+#     dir: multirun/${now:%Y-%m-%d_%H-%M-%S}
+#   launcher:
+#     _target_: hydra_plugins.hydra_submitit_launcher.submitit_launcher.SlurmLauncher
+#     partition: mit_normal
+#     nodes: 1
+#     cpus_per_task: 4
+#     gpus_per_node: 0
+#     mem_gb: 16
+#     timeout_min: 120
+#     submitit_folder: ${hydra.sweep.dir}/.submitit/%j
+#     name: ${hydra.job.name}

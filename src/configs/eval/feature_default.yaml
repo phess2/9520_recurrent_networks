@@ -1,0 +1,7 @@
+num_batches: 2
+precision: bfloat16
+output_dir: feature_eval
+checkpoint_path:
+save_raw_tensors: true
+seed: 0
+

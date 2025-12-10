@@ -1,0 +1,6 @@
+kind: copy
+min_lag: 10
+max_lag: 10
+batch_size: 256
+num_classes: 10
+seq_length: 10

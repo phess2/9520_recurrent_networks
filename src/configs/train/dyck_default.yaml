@@ -1,0 +1,21 @@
+project: recurrent_networks_dyck
+run_name: dyck_${model.architecture}_${model.hidden_dim}
+steps: 50000
+log_every: 50
+eval_every: 500
+eval_steps: 1000
+ckpt_every: 500
+ckpt_metric: nll
+save_best: true
+precision: bfloat16
+entity: phess2-massac
+seed: 0
+wandb_api_key: 172a4c57ff0779bfbe96de3da444e9851729e3d9
+feature_log_every: 500
+feature_log_max_batches: 1
+feature_save_dir: feature_logs/dyck_default
+noise_generalization_stddevs:
+  - 0.0
+  - 0.05
+  - 0.1
+

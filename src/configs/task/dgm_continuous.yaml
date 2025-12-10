@@ -1,0 +1,11 @@
+dims: 6
+obs_dims: 6
+lags: [1, 2]
+discrete_latent: false
+mean_seq_len: 128
+std_seq_len: 16
+batch_size: 16
+burn_in: 16
+seed: 0
+cov_scale: 0.2
+

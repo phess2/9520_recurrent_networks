@@ -1,0 +1,25 @@
+project: recurrent_networks_copy
+run_name: hess_copy_${model.architecture}_${optimizer.lr}_${optimizer.weight_decay}_final
+steps: 25000
+log_every: 250
+eval_every: 1250
+eval_steps: 1000
+ckpt_every: 1250
+ckpt_metric: accuracy
+save_best: true
+precision: bfloat16
+entity: phess2-massac
+seed: 0
+wandb_api_key: 5121db50fd49df0ad590e8c95f79f5d97d165512
+feature_log_every: 1250
+feature_log_max_batches: 1
+feature_save_dir: feature_logs/copy_default
+length_generalization_fractions:
+  - 2.0
+  - 10.0
+noise_generalization_stddevs:
+  - 0.1
+  - 0.5
+disable_checkpointing: false
+sweep_run: false
+official_run: true

@@ -1,0 +1,8 @@
+architecture: lstm
+hidden_dim: 256
+num_layers: 1
+precision: ${train.precision}
+param_dtype: ${train.precision}
+use_layer_norm: false
+rnn_nonlinearity:
+
