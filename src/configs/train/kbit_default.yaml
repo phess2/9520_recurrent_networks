@@ -10,7 +10,7 @@ save_best: true
 precision: bfloat16
 entity: phess2-massac
 seed: 0
-wandb_api_key: 172a4c57ff0779bfbe96de3da444e9851729e3d9
+wandb_api_key:
 feature_log_every: 200
 feature_log_max_batches: 1
 feature_save_dir: feature_logs/kbit_flipflop
