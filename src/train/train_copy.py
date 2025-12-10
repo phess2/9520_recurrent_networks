@@ -786,18 +786,11 @@ def train_copy(
                 )
 
             # Log evaluation metrics
-            eval_nll = aggregated_eval_metrics["nll"]
-            eval_acc = aggregated_eval_metrics["accuracy"]
-            progress_pct = 100.0 * step_index / config.steps
-            print(
-                f"Step {step_index:5d}/{config.steps} ({progress_pct:5.1f}%) | "
-                f"Eval NLL: {eval_nll:.4f} | Eval Acc: {eval_acc:.4f}"
-            )
             wandb.log(
                 {
                     "step": step_index,
-                    "eval/nll": eval_nll,
-                    "eval/accuracy": eval_acc,
+                    "eval/nll": aggregated_eval_metrics["nll"],
+                    "eval/accuracy": aggregated_eval_metrics["accuracy"],
                 }
             )
 
@@ -849,20 +842,6 @@ def train_copy(
                 ),
             )
 
-
-    # ========================================================================
-    # Finalization: Generate final visualizations and summaries
-    # ========================================================================
-
-    if not train_cfg.sweep_run:
-        final_inputs, final_targets, final_mask = dataset()
-        log_prediction_figure(
-            train_cfg.steps, model_params, final_inputs, final_targets, final_mask
-        )
-        if supports_feature_logging:
-            log_jacobian_figure(train_cfg.steps, model_params, final_inputs, final_mask)
-        log_final_jacobian_summary()
-
     # ========================================================================
     # Finalization: Generate final visualizations and summaries
     # ========================================================================
@@ -877,11 +856,6 @@ def train_copy(
         log_final_jacobian_summary()
 
     # Finalize wandb run
-    print("=" * 80)
-    print(f"Training completed: {config.run_name}")
-    if best_metric_value is not None:
-        print(f"Best {config.ckpt_metric}: {best_metric_value:.4f}")
-    print("=" * 80)
     wandb.finish()
 
 
