@@ -5,7 +5,6 @@ from typing import Any, Dict, Tuple
 
 import jax
 import jax.numpy as jnp
-from modula.atom import Linear
 
 from ..utils.jacobian_features import JacobianFeatureSummary, compute_jacobian_features
 from .base import BaseSequenceModel, ModelConfig
