@@ -34,7 +34,7 @@ class CopyDataset:
         )
         # seq_length = jax.random.randint(subkey1,shape=(),minval=10,maxval=50)
         # Actual sequence length for this batch
-        actual_length = lag + 2 * self.seq_length
+        # actual_length = lag + 2 * self.seq_length
         # Maximum possible length (for padding)
         max_length = self.max_lag + 2 * self.seq_length
 
